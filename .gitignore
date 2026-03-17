@@ -1,0 +1,23 @@
+node_modules/
+**/node_modules/
+
+# lockfiles
+package-lock.json
+
+# env files (never commit secrets)
+.env
+.env.*
+**/.env
+**/.env.*
+
+# OS / editor cruft
+.DS_Store
+**/.DS_Store
+
+*.md
+.logs/
+.dist/
+.build/
+.release/
+.cache/
+.turbo/

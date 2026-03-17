@@ -1,0 +1,83 @@
+{
+  "name": "@wagmi/backend",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Wealth Wards – Web3 desktop and web app with Sign-In With Ethereum",
+  "author": "Wealth Wards",
+  "engines": {
+    "node": ">=22.12.0",
+    "npm": ">=10.0.0"
+  },
+  "type": "module",
+  "main": "electron/main.js",
+ "scripts": {
+  "dev": "PORT=3002 node server.js",
+  "server:dev": "nodemon server.js",
+  "start": "PORT=3002 node server.js",
+  "send:welcome": "node send-welcome-emails.js"
+},
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.1.1",
+    "concurrently": "^9.0.0",
+    "cross-env": "^7.0.3",
+    "electron": "^40.4.0",
+    "electron-builder": "^26.7.0",
+    "nodemon": "^3.1.11",
+    "vite": "^7.1.3",
+    "wait-on": "^9.0.3"
+  },
+  "dependencies": {
+    "@reown/appkit": "^1.8.18",
+    "@reown/appkit-adapter-wagmi": "^1.8.18",
+    "@spruceid/siwe-parser": "^3.0.0",
+    "@wagmi/connectors": "^7.1.6",
+    "@wagmi/core": "^3.3.2",
+    "@walletconnect/ethereum-provider": "^2.23.5",
+    "alchemy-sdk": "^3.6.5",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.16.0",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.2.1",
+    "ioredis": "^5.9.2",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^9.1.6",
+    "moralis": "^2.27.2",
+    "siwe": "^3.0.0",
+    "viem": "^2.45.1"
+  },
+  "build": {
+    "appId": "com.wealthwards.app",
+    "productName": "Wealth Wards",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json",
+      "!node_modules",
+      "!server.js",
+      "!landing",
+      "!docs",
+      "!*.txt"
+    ],
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.finance",
+      "icon": "public/landing/favicon.icns"
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "public/landing/favicon.ico"
+    },
+    "linux": {
+      "target": "AppImage",
+      "category": "Finance"
+    }
+  }
+}
