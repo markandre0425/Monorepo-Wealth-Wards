@@ -58,7 +58,7 @@ function createWindow() {
   })
 
   if (isDev) {
-    win.loadURL('http://localhost:5173/')
+    win.loadURL('http://localhost:3000/')
     // DevTools: uncomment the next line when you need the inspector.
     win.webContents.openDevTools()
   } else {

@@ -19,13 +19,17 @@ function getLandingRedirectUrl(): string {
 
 /** Route guard: redirect to landing if user is not logged in (no valid SIWE session). */
 async function requireAuthLoader() {
+  console.log("[Dashboard] requireAuthLoader checking session...");
   try {
     const session = await getWalletSession();
+    console.log("[Dashboard] Session response:", session);
     if (!session?.ok || !session?.address) {
+      console.warn("[Dashboard] Not authenticated, redirecting to landing...");
       return redirect(getLandingRedirectUrl());
     }
     return null;
-  } catch {
+  } catch (err) {
+    console.error("[Dashboard] requireAuthLoader error:", err);
     return redirect(getLandingRedirectUrl());
   }
 }

@@ -4,12 +4,14 @@
  * session as the Wagmi app (SIWE cookie).
  */
 
-// Resolve the API base URL. In turbo monorepo, dashboard runs on :3001 and server on :3002,
-// set VITE_API_URL (or VITE_API_URL_WEB) to http://localhost:3002 so all API calls hit the server.
-const API_BASE = (import.meta.env.VITE_API_URL_WEB as string) || (import.meta.env.VITE_API_URL as string) || '';
+const IS_ELECTRON = typeof navigator !== 'undefined' && navigator.userAgent.includes('Electron');
+
+const API_BASE = IS_ELECTRON 
+  ? (import.meta.env.VITE_API_URL_ELECTRON as string) || 'http://localhost:3002'
+  : (import.meta.env.VITE_API_URL_WEB as string) || (import.meta.env.VITE_API_URL as string) || '';
 
 export function getApiBase(): string {
-  return API_BASE || 'http://localhost:3002';
+  return API_BASE;
 }
 
 function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {

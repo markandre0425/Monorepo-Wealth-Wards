@@ -13,6 +13,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@reown/appkit": "^1.8.19",
+    "@reown/appkit-adapter-wagmi": "^1.8.19",
     "@wagmi/connectors": "^7.2.1",
     "@wagmi/core": "^3.4.0",
     "animejs": "^4.3.5",

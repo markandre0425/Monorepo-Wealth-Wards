@@ -27,6 +27,7 @@ function AppInner() {
 
 
 export default function App() {
+  console.log("[Dashboard] App component rendering...");
   return (
     <ThemeProvider>
       <UserProfileProvider>

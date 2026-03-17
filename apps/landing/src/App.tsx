@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef } from 'react'
-import { connect, signMessage } from '@wagmi/core'
+import { connect, signMessage, watchConnections } from '@wagmi/core'
 // @ts-ignore
-import { config } from './web3-config'
+import { config, IS_ELECTRON, appKitModal } from './web3-config'
 import { injected } from '@wagmi/connectors'
 import { WagmiAPI } from './services/wagmi-api'
 
@@ -9,31 +9,57 @@ import { animate, stagger, utils } from 'animejs'
 import logo from './assets/newicon.png';
 import './App.css'
 
+// Keep track of SIWE to prevent duplicate triggers
+let siweInProgressCount = 0;
 
-
-async function loginHandler() {
-  console.log("1. Login Button Clicked");
+async function handleSiweFlow(address: string) {
+  if (siweInProgressCount > 0) {
+    console.warn("[App] SIWE flow already in progress, skipping duplicate call for:", address);
+    return;
+  }
+  siweInProgressCount++;
+  console.log("3. SIWE Flow Started for:", address);
+  
   try {
-    const { accounts } = await connect(config, { connector: injected() });
-    console.log("2. Wallet Connected:", accounts[0]);
+    const msgData = await WagmiAPI.getSiweMessage(address);
+    console.log("4. Message Received from Backend:", msgData);
 
-    const msgData = await WagmiAPI.getSiweMessage(accounts[0]);
-    console.log("3. Message Received from Backend:", msgData);
-
+    console.log("5a. Requesting signature from wallet...");
     const signature = await signMessage(config, { message: msgData.message });
-    console.log("4. Signature Created:", signature);
+    console.log("5b. Signature Obtained:", signature);
 
+    console.log("6a. Verifying signature on backend...");
     const result = await WagmiAPI.verifySiweMessage(msgData.message, signature);
-    console.log("5. Verification Result:", result);
+    console.log("6b. Verification Result:", result);
 
     if (result.ok) {
       const dashboardUrl = import.meta.env.VITE_DASHBOARD_URL || "http://localhost:3001";
-      window.location.href = dashboardUrl.replace(/\/?$/, "/dashboard/");
+      const target = dashboardUrl.replace(/\/?$/, "/dashboard/");
+      console.log("7. Redirecting to:", target);
+      window.location.href = target;
     } else {
-      console.error("Verification failed on backend");
+      console.error("Verification failed on backend:", result);
     }
   } catch (err) {
-    console.error("CRASH at some step:", err);
+    console.error("SIWE Flow FATAL Error:", err);
+  } finally {
+    siweInProgressCount = 0;
+  }
+}
+
+async function loginHandler() {
+  console.log("1. Login Button Clicked");
+  if (IS_ELECTRON && appKitModal) {
+    console.info("2. Opening AppKit modal...");
+    return appKitModal.open();
+  }
+
+  try {
+    const { accounts } = await connect(config, { connector: injected() });
+    console.log("2. Wallet Connected:", accounts[0]);
+    await handleSiweFlow(accounts[0]);
+  } catch (err) {
+    console.error("Connection Error:", err);
   }
 }
 
@@ -141,6 +167,35 @@ function App() {
 
   }, [])
 
+  // Auto-SIWE for Electron when wallet connects via modal
+  useEffect(() => {
+    if (!IS_ELECTRON || !config) return;
+
+    const unwatch = watchConnections(config, {
+      async onChange(connections) {
+        if (connections.length > 0 && siweInProgressCount === 0) {
+          const address = connections[0].accounts[0];
+          
+          console.info("[App] Wallet connected, checking session for:", address);
+          // Check if we ALREADY have a session for this address to avoid redirect loops
+          const session = await WagmiAPI.getWalletSession();
+          if (session?.ok && session?.address?.toLowerCase() === address.toLowerCase()) {
+            console.info("[App] Active session found for this wallet, redirecting to dashboard...");
+            const dashboardUrl = import.meta.env.VITE_DASHBOARD_URL || "http://localhost:3001";
+            const target = dashboardUrl.replace(/\/?$/, "/dashboard/");
+            window.location.href = target;
+            return;
+          }
+
+          console.info("[App] No active session found, triggering SIWE...");
+          handleSiweFlow(address);
+        }
+      }
+    });
+
+    return () => unwatch();
+  }, []);
+
   return (
     <div className="app" ref={containerRef}>
       <div className="background">
@@ -177,7 +232,7 @@ function App() {
         </p> */}
 
         <button onClick = {loginHandler} className = "connect-dashboard-btn">
-          Connect MetaMask
+          {IS_ELECTRON ? "Connect Wallet" : "Connect MetaMask"}
         </button>
 
         {/* <form className="notify-form" onSubmit={handleSubmit}>

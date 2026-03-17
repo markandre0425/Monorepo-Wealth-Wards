@@ -70,6 +70,9 @@ const UserProfileContext = createContext<UserProfileContextType>({
 // cookie set by the /api proxy (same host) is included in every fetch.
 // Only specify an absolute URL when VITE_API_URL_WEB / VITE_API_URL is explicitly provided.
 const getApiUrl = () => {
+  const IS_ELECTRON = typeof navigator !== 'undefined' && navigator.userAgent.includes('Electron');
+  if (IS_ELECTRON) return import.meta.env.VITE_API_URL_ELECTRON || 'http://localhost:3002';
+
   const apiUrl = import.meta.env.VITE_API_URL_WEB || import.meta.env.VITE_API_URL;
   if (apiUrl) return apiUrl;
 

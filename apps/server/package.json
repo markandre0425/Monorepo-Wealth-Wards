@@ -10,12 +10,12 @@
   },
   "type": "module",
   "main": "electron/main.js",
- "scripts": {
-  "dev": "PORT=3002 node server.js",
-  "server:dev": "nodemon server.js",
-  "start": "PORT=3002 node server.js",
-  "send:welcome": "node send-welcome-emails.js"
-},
+  "scripts": {
+    "dev": "PORT=3002 node server.js",
+    "server:dev": "nodemon server.js",
+    "start": "PORT=3002 node server.js",
+    "send:welcome": "node send-welcome-emails.js"
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
