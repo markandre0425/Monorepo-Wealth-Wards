@@ -6,6 +6,10 @@ export interface UserProfile {
   email: string;
   bio: string;
   avatarUrl: string | null;
+  settings?: {
+    currency: string;
+    language: string;
+  };
 }
 
 // Base URL so avatars work when app is at /dashboard/ (Vite base)
@@ -44,6 +48,10 @@ export const DEFAULT_PROFILE: UserProfile = {
   email: "",
   bio: "Connect your wallet to personalise your profile.",
   avatarUrl: getDefaultAvatar(),
+  settings: {
+    currency: "USD",
+    language: "English",
+  },
 };
 
 interface UserProfileContextType {

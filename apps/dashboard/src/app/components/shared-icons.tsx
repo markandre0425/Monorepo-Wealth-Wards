@@ -157,42 +157,45 @@ export function LogoutIcon() {
   );
 }
 
-export function MoneysIcon() {
+export function MoneysIcon({ isDark = true }: { isDark?: boolean }) {
+  const c = isDark ? 'white' : '#4f46e5';
   return (
     <div className="size-[32px] shrink-0 relative">
       <svg className="absolute block size-full" fill="none" preserveAspectRatio="none" viewBox="0 0 32 32">
-        <path d={svgPaths.p1fe70f00} stroke="white" strokeLinecap="round" strokeLinejoin="round" strokeMiterlimit="10" strokeWidth="2" />
-        <path d={svgPaths.p18870300} stroke="white" strokeLinecap="round" strokeLinejoin="round" strokeMiterlimit="10" strokeWidth="2" />
-        <path d={svgPaths.p31edae40} stroke="white" strokeLinecap="round" strokeLinejoin="round" strokeMiterlimit="10" strokeWidth="2" />
-        <path d="M6.37325 11.0667V16.9335" stroke="white" strokeLinecap="round" strokeLinejoin="round" strokeMiterlimit="10" strokeWidth="2" />
-        <path d="M21.629 11.0671V16.9337" stroke="white" strokeLinecap="round" strokeLinejoin="round" strokeMiterlimit="10" strokeWidth="2" />
+        <path d={svgPaths.p1fe70f00} stroke={c} strokeLinecap="round" strokeLinejoin="round" strokeMiterlimit="10" strokeWidth="2" />
+        <path d={svgPaths.p18870300} stroke={c} strokeLinecap="round" strokeLinejoin="round" strokeMiterlimit="10" strokeWidth="2" />
+        <path d={svgPaths.p31edae40} stroke={c} strokeLinecap="round" strokeLinejoin="round" strokeMiterlimit="10" strokeWidth="2" />
+        <path d="M6.37325 11.0667V16.9335" stroke={c} strokeLinecap="round" strokeLinejoin="round" strokeMiterlimit="10" strokeWidth="2" />
+        <path d="M21.629 11.0671V16.9337" stroke={c} strokeLinecap="round" strokeLinejoin="round" strokeMiterlimit="10" strokeWidth="2" />
       </svg>
     </div>
   );
 }
 
-export function WalletMoneyIcon() {
+export function WalletMoneyIcon({ isDark = true }: { isDark?: boolean }) {
+  const c = isDark ? 'white' : '#4f46e5';
   return (
     <div className="size-[32px] shrink-0 relative">
       <svg className="absolute block size-full" fill="none" preserveAspectRatio="none" viewBox="0 0 32 32">
-        <path d={svgPaths.padadf80} fill="white" />
-        <path d={svgPaths.p24cd8200} fill="white" />
-        <path d={svgPaths.p370efa00} fill="white" />
-        <path d={svgPaths.pdcfba80} fill="white" />
-        <path d={svgPaths.p296f480} fill="white" />
+        <path d={svgPaths.padadf80} fill={c} />
+        <path d={svgPaths.p24cd8200} fill={c} />
+        <path d={svgPaths.p370efa00} fill={c} />
+        <path d={svgPaths.pdcfba80} fill={c} />
+        <path d={svgPaths.p296f480} fill={c} />
       </svg>
     </div>
   );
 }
 
-export function ChartSquareIcon() {
+export function ChartSquareIcon({ isDark = true }: { isDark?: boolean }) {
+  const c = isDark ? 'white' : '#4f46e5';
   return (
     <div className="size-[32px] shrink-0 relative">
       <svg className="absolute block size-full" fill="none" preserveAspectRatio="none" viewBox="0 0 32 32">
-        <path d={svgPaths.p1d535c00} fill="white" />
-        <path d={svgPaths.pdfce600} fill="white" />
-        <path d={svgPaths.p3540f200} fill="white" />
-        <path d={svgPaths.peb6e480} fill="white" />
+        <path d={svgPaths.p1d535c00} fill={c} />
+        <path d={svgPaths.pdfce600} fill={c} />
+        <path d={svgPaths.p3540f200} fill={c} />
+        <path d={svgPaths.peb6e480} fill={c} />
       </svg>
     </div>
   );

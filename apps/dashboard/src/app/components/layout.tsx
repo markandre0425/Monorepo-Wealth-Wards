@@ -224,15 +224,14 @@ function Sidebar() {
             <button
               key={item.path}
               onClick={() => navigate(item.path)}
-              className={`flex gap-[19px] items-center px-[25px] py-[16px] rounded-[16px] cursor-pointer transition-all duration-200 ${
-                active ? "" : ""
-              }`}
+              className={`flex gap-[19px] items-center px-[25px] py-[16px] rounded-[16px] cursor-pointer transition-all duration-200 ${active ? "" : ""
+                }`}
               style={
                 active
                   ? {
-                      backgroundImage:
-                        "linear-gradient(129.101deg, rgb(31, 142, 190) 5.3557%, rgb(68, 4, 149) 29.462%, rgb(68, 4, 149) 56.025%, rgb(177, 2, 205) 81.92%)",
-                    }
+                    backgroundImage:
+                      "linear-gradient(129.101deg, rgb(31, 142, 190) 5.3557%, rgb(68, 4, 149) 29.462%, rgb(68, 4, 149) 56.025%, rgb(177, 2, 205) 81.92%)",
+                  }
                   : { backgroundColor: "transparent" }
               }
               onMouseEnter={(e) => {
@@ -385,9 +384,8 @@ function MobileSidebarOverlay({ isOpen, onClose }: { isOpen: boolean; onClose: (
 
       {/* Sidebar */}
       <div
-        className={`fixed left-0 top-0 h-full w-[280px] flex flex-col pt-[20px] pb-[40px] z-50 transition-transform duration-300 ease-in-out backdrop-blur-[24px] ${
-          isOpen ? "translate-x-0" : "-translate-x-full"
-        }`}
+        className={`fixed left-0 top-0 h-full w-[280px] flex flex-col pt-[20px] pb-[40px] z-50 transition-transform duration-300 ease-in-out backdrop-blur-[24px] ${isOpen ? "translate-x-0" : "-translate-x-full"
+          }`}
         style={{
           background: isDark ? 'rgba(11,11,15,0.92)' : 'rgba(255,255,255,0.88)',
           borderRight: `1px solid ${isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'}`,
@@ -432,9 +430,9 @@ function MobileSidebarOverlay({ isOpen, onClose }: { isOpen: boolean; onClose: (
                 style={
                   active
                     ? {
-                        backgroundImage:
-                          "linear-gradient(129.101deg, rgb(31, 142, 190) 5.3557%, rgb(68, 4, 149) 29.462%, rgb(68, 4, 149) 56.025%, rgb(177, 2, 205) 81.92%)",
-                      }
+                      backgroundImage:
+                        "linear-gradient(129.101deg, rgb(31, 142, 190) 5.3557%, rgb(68, 4, 149) 29.462%, rgb(68, 4, 149) 56.025%, rgb(177, 2, 205) 81.92%)",
+                    }
                     : { backgroundColor: "transparent" }
                 }
                 onMouseEnter={(e) => {

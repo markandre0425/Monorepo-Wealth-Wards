@@ -8,6 +8,10 @@
 
 // Backend API base — same-origin by default (Vite proxy in dev, same host in prod).
 // Set VITE_API_URL_WEB in production to point to the deployed API.
+import scaffoldConfig from "../scaffold.config";
+
+// Backend API base — same-origin by default (Vite proxy in dev, same host in prod).
+// Set VITE_API_URL_WEB in production to point to the deployed API.
 const API_BASE = (import.meta.env.VITE_API_URL_WEB as string) || (import.meta.env.VITE_API_URL as string) || '';
 
 // Known token id -> mainnet contract address (for backend /api/token-price which uses contract address)
@@ -17,7 +21,7 @@ const TOKEN_ID_TO_ADDRESS: Record<string, string> = {
 };
 
 const MORALIS_API_KEY = import.meta.env.VITE_MORALIS_API_KEY;
-const ALCHEMY_API_KEY = import.meta.env.VITE_ALCHEMY_API_KEY;
+const ALCHEMY_API_KEY = scaffoldConfig.alchemyApiKey;
 const ETHERSCAN_API_KEY = import.meta.env.VITE_ETHERSCAN_API_KEY;
 
 interface TokenData {
@@ -223,25 +227,6 @@ async function getBackendTokenPrice(contractAddress: string, chainId = 1): Promi
   }
 }
 
-// CoinGecko (fallback when backend price unavailable)
-async function getCoinGeckoPrice(tokenId: string): Promise<{ price?: number; change24h?: number } | null> {
-  try {
-    const response = await fetch(
-      `/api/coingecko/simple/price?ids=${tokenId}&vs_currencies=usd&include_24hr_change=true`
-    );
-    if (!response.ok) return null;
-    const data = await response.json();
-    if (data[tokenId]) {
-      return {
-        price: data[tokenId].usd,
-        change24h: data[tokenId].usd_24h_change,
-      };
-    }
-    return null;
-  } catch (error) {
-    return null;
-  }
-}
 
 // FALLBACK CHAIN LOGIC
 export async function getTokenData(contractAddress: string): Promise<TokenData> {
@@ -274,8 +259,6 @@ export async function getTokenPrice(tokenId: string = 'ethereum'): Promise<{ pri
       return result;
     }
   }
-  const result = await getCoinGeckoPrice(tokenId);
-  if (result) return result;
   return {};
 }
 
@@ -300,30 +283,11 @@ export async function getMultipleTokenPrices(tokenIds: string[]): Promise<Record
           }
         }
       } catch {
-        // fallback to CoinGecko below
+        // failed
       }
     }
   }
-  try {
-    const idsParam = tokenIds.join(',');
-    const response = await fetch(
-      `/api/coingecko/simple/price?ids=${idsParam}&vs_currencies=usd&include_24hr_change=true`
-    );
-    if (!response.ok) return {};
-    const data = await response.json();
-    const result: Record<string, { price?: number; change24h?: number }> = {};
-    for (const tokenId of tokenIds) {
-      if (data[tokenId]) {
-        result[tokenId] = {
-          price: data[tokenId].usd,
-          change24h: data[tokenId].usd_24h_change,
-        };
-      }
-    }
-    return result;
-  } catch {
-    return {};
-  }
+  return {};
 }
 
 export const BlockchainAPI = {

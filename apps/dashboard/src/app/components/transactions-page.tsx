@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { toast } from "sonner";
 import { useWagmiSession } from "../hooks/useWagmiSession";
 import { getTransactionsFromBackend, type TransactionItem } from "../services/wagmi-api";
+import { Address } from "./Address";
 
 /* Types */
 
@@ -28,17 +29,20 @@ function mapBackendTx(d: TransactionItem, walletAddress: string): Transaction {
   const type = (d.type?.toLowerCase() || "send") as Transaction["type"];
   const amountEth = d.amountEth != null ? parseFloat(String(d.amountEth)) : 0;
   const amount = d.tokenAmount ?? (amountEth < 0.001 && amountEth > 0 ? amountEth.toFixed(6) : amountEth.toFixed(4));
-  const toShort = d.toAddress ? `${d.toAddress.slice(0, 6)}...${d.toAddress.slice(-4)}` : "—";
-  const fromShort = d.fromAddress ? `${d.fromAddress.slice(0, 6)}...${d.fromAddress.slice(-4)}` : "—";
-  const usd = amountEth > 0 ? `$ ${(amountEth * 2800).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—";
+  
+  // Keep raw addresses for component usage
+  const toRaw = d.toAddress || "";
+  const fromRaw = d.fromAddress || walletAddress;
+  
+  const usd = amountEth > 0 ? `$ ${(amountEth * 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—";
   return {
     id: d.id ?? (d.txHash?.slice(0, 10) ?? "tx"),
     hash: d.txHash ?? "",
     type: type === "swap" ? "swap" : type === "receive" ? "receive" : "send",
     asset: d.kind ?? "ETH",
     amount: String(amount),
-    to: toShort,
-    from: d.fromAddress ?? walletAddress,
+    to: toRaw,
+    from: fromRaw,
     date: date.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
     time: date.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false }),
     status: "completed",
@@ -204,14 +208,7 @@ export function TransactionsPage() {
               Connect Account
             </a>
           ) : (
-            <a
-              href={`https://etherscan.io/address/${address}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="font-['Inter',sans-serif] text-[12px] text-[#0FC6C2] hover:underline"
-            >
-              {address.slice(0, 6)}...{address.slice(-4)}
-            </a>
+            <Address address={address} />
           )}
           <span className="font-['Inter',sans-serif] text-[11px] text-[#86909c]">· Ethereum Mainnet</span>
         </div>
@@ -306,7 +303,9 @@ export function TransactionsPage() {
                 {tx.hash.slice(0, 8)}...{tx.hash.slice(-4)}
               </div>
               <div className="flex-1 font-['Inter',sans-serif] font-semibold text-[14px] text-white">{tx.asset}</div>
-              <div className="w-[150px] font-['Inter',sans-serif] font-normal text-[14px] text-white/60">{tx.to}</div>
+              <div className="w-[150px] font-['Inter',sans-serif] font-normal text-[14px] text-white/60">
+                <Address address={tx.to} />
+              </div>
               <div className="w-[140px] font-['Inter',sans-serif] font-semibold text-[14px] text-white text-right">{tx.amount}</div>
               <div className="w-[120px] font-['Inter',sans-serif] font-normal text-[14px] text-[#86909c] text-right">{tx.usd}</div>
               <div className="w-[140px] font-['Inter',sans-serif] font-normal text-[12px] text-[#86909c] text-right">

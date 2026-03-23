@@ -58,12 +58,13 @@ if (globalThis._WAGMI_INIT) {
 
       console.info('[web3-config] VITE_REOWN_PROJECT_ID found:', projectId.slice(0, 8) + '...')
 
+      const alchemyKey = import.meta.env.VITE_ALCHEMY_API_KEY || "oKsh3Sa8Xm98u-B_EuQSXYA5n93ZzThE"
       const wagmiAdapter = new WagmiAdapter({
         projectId,
         networks: [mainnet, sepolia],
         transports: {
-          [mainnet.id]: http(),
-          [sepolia.id]: http(),
+          [mainnet.id]: http(`https://eth-mainnet.g.alchemy.com/v2/${alchemyKey}`),
+          [sepolia.id]: http(`https://eth-sepolia.g.alchemy.com/v2/${alchemyKey}`),
         },
       })
 
@@ -84,12 +85,13 @@ if (globalThis._WAGMI_INIT) {
 
       // ── Web: injected connector only (MetaMask / browser extension) ──
       // Electron must NEVER reach this branch.
+      const alchemyKey = import.meta.env.VITE_ALCHEMY_API_KEY || "oKsh3Sa8Xm98u-B_EuQSXYA5n93ZzThE"
       config = createConfig({
         chains: [mainnet, sepolia],
         connectors: [injected()],
         transports: {
-          [mainnet.id]: http(),
-          [sepolia.id]: http(),
+          [mainnet.id]: http(`https://eth-mainnet.g.alchemy.com/v2/${alchemyKey}`),
+          [sepolia.id]: http(`https://eth-sepolia.g.alchemy.com/v2/${alchemyKey}`),
         },
       })
 

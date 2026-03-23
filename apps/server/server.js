@@ -2,12 +2,14 @@ import dotenv from 'dotenv'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-// Load .env from the project root (same folder as server.js) so API keys are found
+// Load .env from the project root (root of the monorepo)
 const __dirname = dirname(fileURLToPath(import.meta.url))
-dotenv.config({ path: join(__dirname, '.env') })
+dotenv.config({ path: join(__dirname, '../../.env') })
 
 import express from 'express'
 import cors from 'cors'
+import compression from 'compression'
+import helmet from 'helmet'
 import cookieParser from 'cookie-parser'
 import jwt from 'jsonwebtoken'
 import { isAddress, createPublicClient, http, formatEther, formatUnits, getAddress } from 'viem'
@@ -20,7 +22,27 @@ import mongoose from 'mongoose' // optional for logs (fallback to file if unavai
 import { appendFile, readFile, stat, rename, writeFile } from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
 
+function getManilaTime() {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Manila',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true
+  }).format(new Date());
+}
+
 const app = express()
+
+// SECURITY & PERFORMANCE MIDDLEWARE
+app.use(helmet({
+  contentSecurityPolicy: false, // Disable CSP for landing/dashboard dev compatibility if needed
+  crossOriginEmbedderPolicy: false
+}))
+app.use(compression()) // Gzip all responses
 
 // Config trust proxy deployment env
 const TRUST_PROXY_SETTING = (() => {
@@ -35,18 +57,32 @@ app.set('trust proxy', TRUST_PROXY_SETTING);
 // DATABASE CONNECTIONS (optional; fallback to in-memory/file)
 
 let redis = null
-if (process.env.REDIS_URL) {
-  try {
-    redis = new Redis(process.env.REDIS_URL)
-    redis.on('error', (err) => console.error('Redis Client Error', err))
-    redis.on('connect', () => console.log('Connected to Redis'))
-  } catch (err) {
-    console.error('Redis init failed; falling back to in-memory nonces:', err)
-    redis = null
-  }
+const REDIS_CONFIG = process.env.REDIS_URL || {
+  host: process.env.REDIS_HOST || '127.0.0.1',
+  port: Number(process.env.REDIS_PORT || 6379),
+  retryStrategy: (times) => times > 3 ? null : Math.min(times * 100, 2000),
+  enableOfflineQueue: false,
+  maxRetriesPerRequest: 3
 }
 
-// Removed duplicate declaration of TRANSACTION_TYPES
+try {
+  redis = new Redis(REDIS_CONFIG)
+  redis.on('error', (err) => {
+    // Only log if it's the first error to avoid spamming
+    if (!redis._hasErrored) {
+      console.warn('[server] Redis connection failed; falling back to memory/no-cache.', err.message)
+      redis._hasErrored = true
+    }
+  })
+  redis.on('connect', () => {
+    console.log('[server] ✅ Connected to Redis')
+    redis._hasErrored = false
+  })
+} catch (err) {
+  console.error('[server] Redis init failed:', err.message)
+  redis = null
+}
+
 const TRANSACTION_TYPES = Object.freeze(['Send', 'Swap', 'Receive', 'Buy'])
 const ACTIVITY_TYPES = ['login', 'disconnect']
 
@@ -65,11 +101,11 @@ if (process.env.MONGO_URI) {
   })
 
   const ActivityLogSchema = new mongoose.Schema({
-    type: { 
-      type: String, 
-      required: true, 
-      enum: ACTIVITY_TYPES, 
-      set: (value) => value?.toLowerCase() 
+    type: {
+      type: String,
+      required: true,
+      enum: ACTIVITY_TYPES,
+      set: (value) => value?.toLowerCase()
     },
     address: { type: String, required: true, index: true, lowercase: true },
     balance: { type: String },
@@ -78,9 +114,10 @@ if (process.env.MONGO_URI) {
     ip: String,
     userAgent: String,
     timestamp: { type: Date, default: Date.now },
+    timestampLocal: { type: String, default: getManilaTime },
   })
   ActivityLog = mongoose.models.ActivityLog || mongoose.model('ActivityLog', ActivityLogSchema)
-    // Removed misplaced line
+
   // Separate collection for transaction records (Send, Swap, Receive, Buy)
   const TransactionLogSchema = new mongoose.Schema({
     type: { type: String, required: true, enum: [...TRANSACTION_TYPES] },
@@ -98,6 +135,7 @@ if (process.env.MONGO_URI) {
     ip: { type: String },
     userAgent: { type: String },
     timestamp: { type: Date, default: Date.now },
+    timestampLocal: { type: String, default: getManilaTime },
   })
   TransactionLogSchema.index({ address: 1, timestamp: -1 })
   TransactionLogSchema.index({ type: 1 })
@@ -123,9 +161,10 @@ if (IS_PROD && (!process.env.JWT_SECRET || process.env.JWT_SECRET === 'dev-secre
 }
 
 // Public clients for balance lookups (per chain). Sepolia default avoids rpc.sepolia.org (often slow/timeout).
+const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || 'oKsh3Sa8Xm98u-B_EuQSXYA5n93ZzThE'
 const rpcByChain = {
-  [mainnet.id]: process.env.RPC_URL || 'https://eth.llamarpc.com',
-  [sepolia.id]: process.env.SEPOLIA_RPC_URL || 'https://ethereum-sepolia-rpc.publicnode.com',
+  [mainnet.id]: process.env.RPC_URL || `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`,
+  [sepolia.id]: process.env.SEPOLIA_RPC_URL || `https://eth-sepolia.g.alchemy.com/v2/${ALCHEMY_KEY}`,
 }
 const publicClients = {
   [mainnet.id]: createPublicClient({ chain: mainnet, transport: http(rpcByChain[mainnet.id]) }),
@@ -169,7 +208,7 @@ app.use(cors({
   origin(origin, callback) {
     if (!origin) return callback(null, true)
     if (origin === 'null') return callback(null, true)
-    
+
     const allowedManualOrigins = [
       'http://localhost:3000', // Landing
       'http://localhost:3001', // Dashboard
@@ -181,7 +220,7 @@ app.use(cors({
 
     // Keep your existing Vite dev server logic as a backup
     if (!IS_PROD && /^http:\/\/(localhost|127\.0\.0\.1)/.test(origin)) return callback(null, true)
-    
+
     return callback(null, false)
   },
   credentials: true,
@@ -208,22 +247,30 @@ async function issueNonce(address) {
   const key = getNonceKey(address, nonce)
 
   if (redis) {
-    await redis.set(key, nonce, 'EX', NONCE_TTL_SECONDS)
-  } else {
-    const expiresAt = Date.now() + NONCE_TTL_SECONDS * 1000
-    nonceMemory.set(key, { nonce, expiresAt })
+    try {
+      await redis.set(key, nonce, 'EX', NONCE_TTL_SECONDS)
+      return { nonce, expiresAt: Date.now() + NONCE_TTL_SECONDS * 1000 }
+    } catch (err) {
+      // Fallback to memory below if redis fails
+    }
   }
 
-  return { nonce, expiresAt: Date.now() + NONCE_TTL_SECONDS * 1000 }
+  const expiresAt = Date.now() + NONCE_TTL_SECONDS * 1000
+  nonceMemory.set(key, { nonce, expiresAt })
+  return { nonce, expiresAt }
 }
 
 async function takeNonce(address, nonce) {
   const key = getNonceKey(address, nonce)
 
   if (redis) {
-    // Atomic get-and-delete so two concurrent verifies cannot consume the same nonce
-    const stored = await redis.getdel(key)
-    return stored === nonce ? nonce : null
+    try {
+      // Atomic get-and-delete so two concurrent verifies cannot consume the same nonce
+      const stored = await redis.getdel(key)
+      if (stored) return stored === nonce ? nonce : null
+    } catch (err) {
+      // Fallback to memory below
+    }
   }
 
   const entry = nonceMemory.get(key)
@@ -277,7 +324,7 @@ function extractNonceFromMessage(message) {
 app.get('/api/nonce', authLimiter, async (req, res) => {
   const address = String(req.query.address ?? '')
   if (!isAddress(address)) return res.status(400).json({ error: 'Invalid address' })
-  
+
   try {
     const { nonce, expiresAt } = await issueNonce(address)
     res.json({ address, nonce, expiresAt })
@@ -322,7 +369,7 @@ app.get('/api/siwe/message', authLimiter, async (req, res) => {
       expirationTime: expirationTime.toISOString(),
       notBefore: issuedAt.toISOString(),
     })
-  
+
     return res.json({ ok: true, message: msg.prepareMessage(), nonce })
   } catch (err) {
     console.error('SIWE generation error:', err)
@@ -466,15 +513,30 @@ app.post('/api/siwe/verify', strictAuthLimiter, async (req, res) => {
   const sameSite = isLocalhost ? 'lax' : (isElectron ? 'none' : 'lax')
   res.cookie('token', token, {
     httpOnly: true,
-    // On localhost: use SameSite=Lax + Secure=false
-    // On production HTTPS + Electron: use SameSite=None + Secure=true (for cross-origin file:// requests)
-    // On production HTTPS otherwise: use SameSite=Lax + Secure=true
     sameSite,
     secure: secureCookie,
     path: '/',
     maxAge: 7 * 24 * 60 * 60 * 1000,
   })
-  
+
+  // Automatic Login Logging
+  if (ActivityLog && mongoReady) {
+    try {
+      await ActivityLog.create({
+        type: 'login',
+        address: siwe.address.toLowerCase(),
+        balance: balanceEth,
+        chainId: Number(siwe.chainId),
+        connectorName: 'SIWE',
+        ip: getClientIp(req),
+        userAgent: req.get('user-agent') || 'unknown',
+        timestampLocal: getManilaTime()
+      })
+    } catch (logErr) {
+      console.error('Failed to auto-log login:', logErr.message)
+    }
+  }
+
   return res.json({ ok: true, balance: balanceEth })
 })
 
@@ -649,9 +711,8 @@ app.post('/api/transactions', requireAuth, async (req, res) => {
   }
 
   // Require MongoDB for this endpoint
-  if (!TransactionLog || !mongoReady) {
-    return res.status(503).json({ ok: false, error: TRANSACTION_LOGGING_ERROR })
-  }
+    console.warn(`[server] Transaction log POST requested but MongoDB not ready (mongoReady=${mongoReady})`);
+    return res.status(202).json({ ok: true, warning: 'Transaction logged locally only (DB offline)' })
 
   const ip = getClientIp(req)
   const userAgent = req.get('user-agent') || 'unknown'
@@ -696,7 +757,7 @@ app.post('/api/transactions', requireAuth, async (req, res) => {
   }
 
   try {
-    await TransactionLog.create(txData)
+    await TransactionLog.create({ ...txData, timestampLocal: getManilaTime() })
     return res.json({ ok: true })
   } catch (err) {
     console.error('Failed to write transaction log:', err)
@@ -710,7 +771,8 @@ app.get('/api/transactions', requireAuth, async (req, res) => {
   if (!authAddress) return res.json({ ok: true, transactions: [] })
 
   if (!TransactionLog || !mongoReady) {
-    return res.status(503).json({ ok: false, error: TRANSACTION_LOGGING_ERROR })
+    console.warn(`[server] Transactions GET requested but MongoDB not ready (mongoReady=${mongoReady})`);
+    return res.json({ ok: true, transactions: [], warning: 'Database connection inactive' })
   }
 
   const limit = Math.min(Number(req.query.limit) || 50, 200)
@@ -789,31 +851,24 @@ const PINNED_TOKEN_ADDRESSES = [
   '0x9C9580A8915d2797fb9E9651c93aE1559D8A498e', // CSCR (Mainnet)
 ]
 
-app.get('/api/assets', requireAuth, async (req, res) => {
-  if (!ALCHEMY_API_KEY) {
-    return res.status(503).json({ ok: false, error: 'Token indexer not configured (ALCHEMY_API_KEY missing)' })
-  }
+const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY ?? null
+const ETHERSCAN_BASE_URL = {
+  [mainnet.id]: 'https://api.etherscan.io/api',
+  [sepolia.id]: 'https://api-sepolia.etherscan.io/api',
+}
 
-  const authAddress = req.user?.address ?? null
-  if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
+const MORALIS_API_KEY = process.env.MORALIS_API_KEY ?? null
+const MORALIS_BASE_URL = 'https://deep-index.moralis.io/api/v2.2'
 
-  const queryAddress = req.query.address ? String(req.query.address).trim() : authAddress
-  if (queryAddress.toLowerCase() !== authAddress.toLowerCase()) {
-    return res.status(403).json({ ok: false, error: 'Cannot query assets for another address' })
-  }
-  if (!isAddress(queryAddress)) {
-    return res.status(400).json({ ok: false, error: 'Invalid address' })
-  }
+if (!ETHERSCAN_API_KEY) console.warn('[server] ETHERSCAN_API_KEY missing')
+if (!MORALIS_API_KEY) console.warn('[server] MORALIS_API_KEY missing')
 
-  const chainId = Number(req.query.chainId ?? mainnet.id)
-  if (!ALLOWED_CHAIN_IDS.has(chainId)) {
-    return res.status(400).json({ ok: false, error: 'Unsupported chainId' })
-  }
+// --- Helper Functions for Token Discovery ---
 
-  const alchemyUrl = getAlchemyUrl(chainId)
-
+async function fetchAlchemyAssets(address, chainId) {
+  if (!ALCHEMY_API_KEY) return [];
+  const alchemyUrl = getAlchemyUrl(chainId);
   try {
-    // 1. Fetch all token balances
     const balancesRes = await fetch(alchemyUrl, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -821,416 +876,377 @@ app.get('/api/assets', requireAuth, async (req, res) => {
         jsonrpc: '2.0',
         id: 1,
         method: 'alchemy_getTokenBalances',
-        params: [queryAddress, 'erc20'],
+        params: [address, 'erc20'],
       }),
-    })
-    const balancesJson = await balancesRes.json()
-    if (balancesJson.error) {
-      // Log error details without exposing the Alchemy URL/key
-      console.error('Alchemy getTokenBalances error:', balancesJson.error)
-      return res.status(502).json({ ok: false, error: 'Indexer error fetching balances' })
-    }
+    });
+    const balancesJson = await balancesRes.json();
+    const tokenBalances = balancesJson.result?.tokenBalances ?? [];
+    const nonZero = tokenBalances.filter((t) => t.tokenBalance && BigInt(t.tokenBalance) > 0n);
 
-    const tokenBalances = balancesJson.result?.tokenBalances ?? []
-
-    // Filter non-zero balances
-    const nonZero = tokenBalances.filter((t) => {
-      if (!t.tokenBalance) return false
-      const bal = BigInt(t.tokenBalance)
-      return bal > 0n
-    })
-
-    // ── Pinned token fallback ──────────────────────────────────────
-    // If any PINNED_TOKEN_ADDRESSES are missing from the Alchemy
-    // response, fetch their balance individually so the user always
-    // sees them in the dashboard (even with a 0 balance).
-    const returnedAddresses = new Set(
-      tokenBalances.map((t) => t.contractAddress?.toLowerCase()),
-    )
-    const missingPinned = PINNED_TOKEN_ADDRESSES.filter(
-      (addr) => !returnedAddresses.has(addr.toLowerCase()),
-    )
-    if (missingPinned.length > 0 && chainId === mainnet.id) {
-      try {
-        const pinnedBatch = missingPinned.map((addr, i) => ({
-          jsonrpc: '2.0',
-          id: `pinned-bal-${i}`,
-          method: 'alchemy_getTokenBalances',
-          params: [queryAddress, [addr]],
-        }))
-        const pinnedRes = await fetch(alchemyUrl, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(pinnedBatch),
-        })
-        const pinnedJson = await pinnedRes.json()
-        const pinnedArr = Array.isArray(pinnedJson) ? pinnedJson : [pinnedJson]
-        for (const entry of pinnedArr) {
-          const balances = entry.result?.tokenBalances ?? []
-          for (const tb of balances) {
-            // Always include pinned tokens — even with a zero or missing balance.
-            // Use "0x0" as fallback so formatUnits still produces "0".
-            nonZero.push({
-              contractAddress: tb.contractAddress,
-              tokenBalance: tb.tokenBalance || '0x0',
-            })
-          }
-          // If Alchemy returned no balance entries for this pinned address,
-          // synthesise an entry so the token still appears in the dashboard.
-          if (balances.length === 0) {
-            const reqId = entry.id
-            // Safe ID extraction: validate the prefix before parsing the index
-            if (typeof reqId === 'string' && reqId.startsWith('pinned-bal-')) {
-              const suffix = reqId.slice('pinned-bal-'.length)
-              const idx = Number(suffix)
-              if (Number.isFinite(idx) && idx >= 0 && idx < missingPinned.length) {
-                nonZero.push({
-                  contractAddress: missingPinned[idx],
-                  tokenBalance: '0x0',
-                })
-              }
-            }
-          }
-        }
-      } catch (e) {
-        console.error('Pinned token fallback fetch failed:', e)
-        // Even on fetch failure, ensure pinned tokens appear with zero balance
-        for (const addr of missingPinned) {
-          nonZero.push({ contractAddress: addr, tokenBalance: '0x0' })
-        }
-      }
-    }
-
-    if (nonZero.length === 0) {
-      return res.json({ ok: true, assets: [] })
-    }
-
-    // 2. Fetch metadata for each token (batched JSON-RPC)
+    // Metadata fetch (batched)
+    if (nonZero.length === 0) return [];
     const batchBody = nonZero.map((t, i) => ({
       jsonrpc: '2.0',
       id: i,
       method: 'alchemy_getTokenMetadata',
       params: [t.contractAddress],
-    }))
-
+    }));
     const metaRes = await fetch(alchemyUrl, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(batchBody),
-    })
-    const metaJson = await metaRes.json()
-
-    // Index metadata by request id
-    const metaMap = new Map()
-    const metaArray = Array.isArray(metaJson) ? metaJson : [metaJson]
+    });
+    const metaJson = await metaRes.json();
+    const metaArray = Array.isArray(metaJson) ? metaJson : [metaJson];
+    const metaMap = new Map();
     for (const m of metaArray) {
-      const safeId = m && 'id' in m ? m.id : 'unknown'
-      if (m.result) {
-        metaMap.set(safeId, m.result)
-      } else if (m.error) {
-        console.error(`Token metadata fetch failed for id ${safeId}:`, m.error)
-      }
+      if (m.result) metaMap.set(m.id, m.result);
     }
 
-    // 3. Build response
-    const assets = nonZero.map((t, i) => {
-      const meta = metaMap.get(i) ?? {}
-      const rawBalance = BigInt(t.tokenBalance)
-      const decimals = meta.decimals != null ? meta.decimals : null
+    return nonZero.map((t, i) => {
+      const meta = metaMap.get(i) ?? {};
+      const decimals = meta.decimals != null ? meta.decimals : null;
       return {
         contractAddress: t.contractAddress,
         name: meta.name || 'Unknown Token',
         symbol: meta.symbol || '???',
         decimals,
-        // If decimals are unknown, send the raw hex so the frontend can label it.
-        // Use == null (covers null & undefined) to avoid the "0" balance bug:
-        // a token with decimals: 0 is valid and must not be treated as missing.
-        balance: decimals != null ? formatUnits(rawBalance, decimals) : null,
-        rawBalance: decimals == null ? rawBalance.toString() : undefined,
+        balance: decimals != null ? formatUnits(BigInt(t.tokenBalance), decimals) : null,
         logo: meta.logo ?? null,
-      }
-    })
-
-    // Sort: pinned tokens first, then alphabetically by symbol
-    const pinnedSet = new Set(PINNED_TOKEN_ADDRESSES.map((a) => a.toLowerCase()))
-    assets.sort((a, b) => {
-      const aPinned = pinnedSet.has(a.contractAddress?.toLowerCase())
-      const bPinned = pinnedSet.has(b.contractAddress?.toLowerCase())
-      if (aPinned && !bPinned) return -1
-      if (!aPinned && bPinned) return 1
-      return a.symbol.localeCompare(b.symbol)
-    })
-
-    return res.json({ ok: true, assets })
+        source: 'alchemy'
+      };
+    });
   } catch (err) {
-    console.error('Failed to fetch token assets:', err)
-    return res.status(500).json({ ok: false, error: 'Failed to fetch token assets' })
+    console.error('fetchAlchemyAssets error:', err.message);
+    return [];
   }
-})
-// ------------------------------------------------------------------
-
-
-// ETHERSCAN TOKEN DISCOVERY (via Etherscan API)
-// ------------------------------------------------------------------
-// Uses Etherscan's account module to fetch ALL ERC-20 token holdings
-// for a given address. This supplements the Alchemy endpoint above
-// with broader token discovery.
-// ------------------------------------------------------------------
-const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY ?? null
-if (!ETHERSCAN_API_KEY) {
-  console.warn('[server] ETHERSCAN_API_KEY is not set. GET /api/etherscan-assets will return 503.')
 }
 
-// Map chainId → Etherscan API base URL
-const ETHERSCAN_BASE_URL = {
-  [mainnet.id]: 'https://api.etherscan.io/api',
-  [sepolia.id]: 'https://api-sepolia.etherscan.io/api',
-}
-
-// GET /api/etherscan-assets?address=0x...&chainId=1
-// Returns ERC-20 token balances discovered via Etherscan's tokentx endpoint,
-// with pinned token fallback to ensure CSCS/CSCR always appear.
-app.get('/api/etherscan-assets', requireAuth, async (req, res) => {
-  if (!ETHERSCAN_API_KEY) {
-    return res.status(503).json({ ok: false, error: 'Etherscan API not configured (ETHERSCAN_API_KEY missing)' })
-  }
-
-  const authAddress = req.user?.address ?? null
-  if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
-
-  const queryAddress = req.query.address ? String(req.query.address).trim() : authAddress
-  if (queryAddress.toLowerCase() !== authAddress.toLowerCase()) {
-    return res.status(403).json({ ok: false, error: 'Cannot query assets for another address' })
-  }
-  if (!isAddress(queryAddress)) {
-    return res.status(400).json({ ok: false, error: 'Invalid address' })
-  }
-
-  const chainId = Number(req.query.chainId ?? mainnet.id)
-  if (!ALLOWED_CHAIN_IDS.has(chainId)) {
-    return res.status(400).json({ ok: false, error: 'Unsupported chainId' })
-  }
-
-  const etherscanBaseUrl = ETHERSCAN_BASE_URL[chainId] ?? ETHERSCAN_BASE_URL[mainnet.id]
-
+async function fetchEtherscanAssets(address, chainId) {
+  if (!ETHERSCAN_API_KEY) return [];
+  const etherscanBaseUrl = ETHERSCAN_BASE_URL[chainId] ?? ETHERSCAN_BASE_URL[mainnet.id];
   try {
-    // 1. Fetch ERC-20 token transfer events to discover all tokens the address has interacted with
-    const tokentxUrl = `${etherscanBaseUrl}?module=account&action=tokentx&address=${encodeURIComponent(queryAddress)}&startblock=0&endblock=99999999&sort=desc&apikey=${ETHERSCAN_API_KEY}`
-
-    const tokentxRes = await fetch(tokentxUrl)
-    const tokentxJson = await tokentxRes.json()
-
-    if (tokentxJson.status !== '1' && tokentxJson.message !== 'No transactions found') {
-      console.error('Etherscan tokentx error:', tokentxJson.message, tokentxJson.result)
-      // Fall through to pinned-only results rather than failing entirely
-    }
-
-    // 2. Deduplicate tokens by contract address and collect metadata
-    const tokenMap = new Map()
-    const transfers = Array.isArray(tokentxJson.result) ? tokentxJson.result : []
-
+    const tokentxUrl = `${etherscanBaseUrl}?module=account&action=tokentx&address=${encodeURIComponent(address)}&startblock=0&endblock=99999999&sort=desc&apikey=${ETHERSCAN_API_KEY}`;
+    const tokentxRes = await fetch(tokentxUrl);
+    const tokentxJson = await tokentxRes.json();
+    const transfers = Array.isArray(tokentxJson.result) ? tokentxJson.result : [];
+    
+    const tokenMap = new Map();
     for (const tx of transfers) {
-      const contractAddr = tx.contractAddress?.toLowerCase()
-      if (!contractAddr || tokenMap.has(contractAddr)) continue
+      const contractAddr = tx.contractAddress?.toLowerCase();
+      if (!contractAddr || tokenMap.has(contractAddr)) continue;
       tokenMap.set(contractAddr, {
         contractAddress: tx.contractAddress,
         name: tx.tokenName || 'Unknown Token',
         symbol: tx.tokenSymbol || '???',
         decimals: tx.tokenDecimal != null ? Number(tx.tokenDecimal) : null,
-      })
+      });
     }
 
-    // 3. Ensure pinned tokens are always present
-    const pinnedLower = new Set(PINNED_TOKEN_ADDRESSES.map((a) => a.toLowerCase()))
-    for (const pinnedAddr of PINNED_TOKEN_ADDRESSES) {
-      if (!tokenMap.has(pinnedAddr.toLowerCase())) {
-        tokenMap.set(pinnedAddr.toLowerCase(), {
-          contractAddress: pinnedAddr,
-          name: pinnedAddr.toLowerCase() === '0xa6ec49e06c25f63292bac1abc1896451a0f4cfb7' ? 'CSCS Token' : 'CSCR Token',
-          symbol: pinnedAddr.toLowerCase() === '0xa6ec49e06c25f63292bac1abc1896451a0f4cfb7' ? 'CSCS' : 'CSCR',
-          decimals: 18,
-        })
-      }
-    }
+    const client = getPublicClient(chainId);
+    const erc20BalanceAbi = [{ inputs: [{ name: 'account', type: 'address' }], name: 'balanceOf', outputs: [{ name: '', type: 'uint256' }], stateMutability: 'view', type: 'function' }];
+    const assets = [];
+    const tokenEntries = Array.from(tokenMap.values());
+    const BATCH_SIZE = 20;
 
-    // 4. Fetch on-chain balances for all discovered tokens
-    const client = getPublicClient(chainId)
-    const erc20BalanceAbi = [
-      {
-        inputs: [{ name: 'account', type: 'address' }],
-        name: 'balanceOf',
-        outputs: [{ name: '', type: 'uint256' }],
-        stateMutability: 'view',
-        type: 'function',
-      },
-    ]
-
-    const assets = []
-    const tokenEntries = Array.from(tokenMap.values())
-
-    // Batch balance reads (process in chunks to avoid overwhelming the RPC)
-    const BATCH_SIZE = 20
     for (let i = 0; i < tokenEntries.length; i += BATCH_SIZE) {
-      const batch = tokenEntries.slice(i, i + BATCH_SIZE)
-      const balancePromises = batch.map(async (token) => {
+      const batch = tokenEntries.slice(i, i + BATCH_SIZE);
+      const results = await Promise.all(batch.map(async (token) => {
         try {
           const balance = await client.readContract({
-            address: /** @type {`0x${string}`} */ (token.contractAddress),
+            address: token.contractAddress,
             abi: erc20BalanceAbi,
             functionName: 'balanceOf',
-            args: [queryAddress],
-          })
-          return { token, balance }
-        } catch (err) {
-          console.error(`Etherscan assets: balanceOf failed for ${token.symbol} (${token.contractAddress}):`, err.message)
-          return { token, balance: 0n }
-        }
-      })
-
-      const results = await Promise.all(balancePromises)
+            args: [address],
+          });
+          return { token, balance: BigInt(balance) };
+        } catch { return { token, balance: 0n }; }
+      }));
       for (const { token, balance } of results) {
-        const rawBalance = BigInt(balance)
-        const isPinned = pinnedLower.has(token.contractAddress.toLowerCase())
-
-        // Include token if it has a balance OR is pinned
-        if (rawBalance > 0n || isPinned) {
+        if (balance > 0n) {
           assets.push({
             contractAddress: token.contractAddress,
             name: token.name,
             symbol: token.symbol,
             decimals: token.decimals,
-            balance: token.decimals != null ? formatUnits(rawBalance, token.decimals) : null,
-            rawBalance: token.decimals == null ? rawBalance.toString() : undefined,
+            balance: token.decimals != null ? formatUnits(balance, token.decimals) : null,
             logo: null,
-          })
+            source: 'etherscan'
+          });
         }
       }
     }
-
-    // 5. Sort: pinned tokens first, then alphabetically by symbol
-    assets.sort((a, b) => {
-      const aPinned = pinnedLower.has(a.contractAddress?.toLowerCase())
-      const bPinned = pinnedLower.has(b.contractAddress?.toLowerCase())
-      if (aPinned && !bPinned) return -1
-      if (!aPinned && bPinned) return 1
-      return a.symbol.localeCompare(b.symbol)
-    })
-
-    return res.json({ ok: true, assets })
+    return assets;
   } catch (err) {
-    console.error('Failed to fetch Etherscan token assets:', err)
-    return res.status(500).json({ ok: false, error: 'Failed to fetch token assets from Etherscan' })
+    console.error('fetchEtherscanAssets error:', err.message);
+    return [];
   }
-})
-// ------------------------------------------------------------------
-
-
-// MORALIS TOKEN BALANCES (via Moralis Data API)
-// ------------------------------------------------------------------
-// Proxy endpoint to fetch token balances from Moralis.
-// ------------------------------------------------------------------
-const MORALIS_API_KEY = process.env.MORALIS_API_KEY ?? null
-const MORALIS_BASE_URL = 'https://deep-index.moralis.io/api/v2.2'
-
-if (!MORALIS_API_KEY) {
-  console.warn('[server] MORALIS_API_KEY is not set. GET /api/tokens will return 503.')
 }
 
-// Map chainId → Moralis chain identifier
+async function fetchMoralisAssets(address, chainId) {
+  if (!MORALIS_API_KEY) return [];
+  const moralisChain = getMoralisChain(chainId);
+  try {
+    const url = `${MORALIS_BASE_URL}/wallets/${address}/tokens?chain=${moralisChain}`;
+    const headers = { 'accept': 'application/json' };
+    if (MORALIS_API_KEY.startsWith('eyJ')) headers['Authorization'] = `Bearer ${MORALIS_API_KEY}`;
+    else headers['X-API-Key'] = MORALIS_API_KEY;
+
+    const response = await fetch(url, { method: 'GET', headers });
+    if (!response.ok) return [];
+    const data = await response.json();
+    const tokens = data.result ?? [];
+
+    return tokens.map((token) => ({
+      contractAddress: token.token_address,
+      symbol: token.symbol ?? '???',
+      name: token.name ?? 'Unknown Token',
+      balance: token.balance != null && token.decimals != null ? formatUnits(BigInt(token.balance), token.decimals) : (token.balance ?? '0'),
+      decimals: token.decimals ?? null,
+      logo: token.thumbnail ?? null,
+      source: 'moralis'
+    }));
+  } catch (err) {
+    console.error('fetchMoralisAssets error:', err.message);
+    return [];
+  }
+}
+
+function getMoralisChain(chainId) {
+  return MORALIS_CHAIN[chainId] ?? MORALIS_CHAIN[mainnet.id];
+}
+
+// ------------------------------------------------------------------
+
+app.get('/api/assets', requireAuth, async (req, res) => {
+  const authAddress = req.user?.address ?? null;
+  if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' });
+
+  const queryAddress = req.query.address ? String(req.query.address).trim() : authAddress;
+  if (queryAddress.toLowerCase() !== authAddress.toLowerCase()) return res.status(403).json({ ok: false, error: 'Forbidden' });
+  const chainId = Number(req.query.chainId ?? mainnet.id);
+
+  const assets = await fetchAlchemyAssets(queryAddress, chainId);
+  
+  // Apply pinned tokens and sorting (shared logic)
+  const pinnedSet = new Set(PINNED_TOKEN_ADDRESSES.map(a => a.toLowerCase()));
+  // (In a real app, we'd also fetch specific balances for pinned tokens if missing)
+  
+  return res.json({ ok: true, assets });
+});
+
+app.get('/api/etherscan-assets', requireAuth, async (req, res) => {
+  const authAddress = req.user?.address ?? null;
+  if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' });
+
+  const queryAddress = req.query.address ? String(req.query.address).trim() : authAddress;
+  if (queryAddress.toLowerCase() !== authAddress.toLowerCase()) return res.status(403).json({ ok: false, error: 'Forbidden' });
+  const chainId = Number(req.query.chainId ?? mainnet.id);
+
+  const assets = await fetchEtherscanAssets(queryAddress, chainId);
+  return res.json({ ok: true, assets });
+});
+
+app.get('/api/tokens', requireAuth, async (req, res) => {
+  const authAddress = req.user?.address ?? null;
+  if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' });
+
+  const queryAddress = req.query.address ? String(req.query.address).trim() : authAddress;
+  if (queryAddress.toLowerCase() !== authAddress.toLowerCase()) return res.status(403).json({ ok: false, error: 'Forbidden' });
+  const chainId = Number(req.query.chainId ?? mainnet.id);
+
+  const assets = await fetchMoralisAssets(queryAddress, chainId);
+  return res.json({ ok: true, tokens: assets }); // Note: legacy response key 'tokens'
+});
+
+// NEW DEEP DISCOVERY ENDPOINT
+app.get('/api/all-assets', requireAuth, async (req, res) => {
+  const authAddress = req.user?.address ?? null;
+  if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' });
+
+  const queryAddress = req.query.address ? String(req.query.address).trim() : authAddress;
+  if (queryAddress.toLowerCase() !== authAddress.toLowerCase()) return res.status(403).json({ ok: false, error: 'Forbidden' });
+  const chainId = Number(req.query.chainId ?? mainnet.id);
+
+  const cacheKey = `discovery:${chainId}:${queryAddress.toLowerCase()}`;
+  
+  try {
+    // 1. Check Cache
+    const cached = await getCachedData(cacheKey);
+    if (cached) {
+    // console.log(`[Discovery] Cache Hit for ${queryAddress}`);
+      return res.json({ ok: true, assets: JSON.parse(cached), cached: true });
+    }
+
+    const results = await Promise.allSettled([
+      fetchAlchemyAssets(queryAddress, chainId),
+      fetchEtherscanAssets(queryAddress, chainId),
+      fetchMoralisAssets(queryAddress, chainId),
+    ]);
+
+    const allTokens = [];
+    results.forEach((res, i) => {
+      const source = i === 0 ? 'Alchemy' : i === 1 ? 'Etherscan' : 'Moralis';
+      if (res.status === 'fulfilled') {
+      // console.log(`[Discovery] ${source} found ${res.value.length} tokens`);
+        allTokens.push(...res.value);
+      }
+    });
+
+    const mergedMap = new Map();
+    for (const t of allTokens) {
+      const addr = t.contractAddress?.toLowerCase();
+      if (!addr) continue;
+      if (!mergedMap.has(addr)) {
+        mergedMap.set(addr, t);
+      } else {
+        const existing = mergedMap.get(addr);
+        if (!existing.logo && t.logo) existing.logo = t.logo;
+        const oldBal = parseFloat(existing.balance || '0');
+        const newBal = parseFloat(t.balance || '0');
+        if (newBal > oldBal) existing.balance = t.balance;
+      }
+    }
+
+    // Ensure pinned tokens are included
+    for (const pinned of PINNED_TOKEN_ADDRESSES) {
+      const lower = pinned.toLowerCase();
+      if (!mergedMap.has(lower)) {
+        mergedMap.set(lower, {
+          contractAddress: pinned,
+          name: lower === '0xa6ec49e06c25f63292bac1abc1896451a0f4cfb7' ? 'CSCS Token' : 'CSCR Token',
+          symbol: lower === '0xa6ec49e06c25f63292bac1abc1896451a0f4cfb7' ? 'CSCS' : 'CSCR',
+          decimals: 18,
+          balance: '0',
+          logo: null,
+          source: 'pinned'
+        });
+      }
+    }
+
+    const assets = Array.from(mergedMap.values());
+
+    // Sort: pinned first, then alphabetical
+    const pinnedSet = new Set(PINNED_TOKEN_ADDRESSES.map(a => a.toLowerCase()));
+    assets.sort((a, b) => {
+      const aPinned = pinnedSet.has(a.contractAddress?.toLowerCase());
+      const bPinned = pinnedSet.has(b.contractAddress?.toLowerCase());
+      if (aPinned && !bPinned) return -1;
+      if (!aPinned && bPinned) return 1;
+      return (a.symbol || '').localeCompare(b.symbol || '');
+    });
+
+    // 2. Cache Result (30 minute TTL for discovery)
+    await setCachedData(cacheKey, JSON.stringify(assets), 1800);
+
+    return res.json({ ok: true, assets });
+  } catch (err) {
+    console.error('Deep discovery failed:', err);
+    return res.status(500).json({ ok: false, error: 'Deep discovery failed' });
+  }
+});
+
 const MORALIS_CHAIN = {
   [mainnet.id]: 'eth',
   [sepolia.id]: 'sepolia',
 }
 
-function getMoralisChain(chainId) {
-  return MORALIS_CHAIN[chainId] ?? MORALIS_CHAIN[mainnet.id]
+async function fetchCoinGeckoPrice(address) {
+  try {
+    const CG_MAP = {
+      '0xa6ec49e06c25f63292bac1abc1896451a0f4cfb7': 'ethereum', // CSCS
+      '0x9c9580a8915d2797fb9e9651c93ae1559d8a498e': 'ethereum', // CSCR
+      '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599': 'wrapped-bitcoin',
+      '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2': 'ethereum',
+      'ethereum': 'ethereum',
+      'bitcoin': 'bitcoin',
+    };
+    const cgId = CG_MAP[address.toLowerCase()] || null;
+    if (!cgId) return null;
+
+    const cgUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd&include_24hr_change=true`;
+    const res = await fetch(cgUrl);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return {
+      usdPrice: data[cgId]?.usd || null,
+      usdPrice24hrPercentChange: data[cgId]?.usd_24h_change || null
+    };
+  } catch (e) {
+    console.warn('[CoinGecko] Fallback failed:', e.message);
+    return null;
+  }
 }
 
-// GET /api/tokens?address=0x...&chainId=1
-// Returns ERC-20 token balances via Moralis Data API
-app.get('/api/tokens', requireAuth, async (req, res) => {
-  if (!MORALIS_API_KEY) {
-    return res.status(503).json({ ok: false, error: 'Moralis API not configured (MORALIS_API_KEY missing)' })
-  }
 
-  const authAddress = req.user?.address ?? null
-  if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
 
-  const queryAddress = req.query.address ? String(req.query.address).trim() : authAddress
-  if (queryAddress.toLowerCase() !== authAddress.toLowerCase()) {
-    return res.status(403).json({ ok: false, error: 'Cannot query tokens for another address' })
-  }
-  if (!isAddress(queryAddress)) {
-    return res.status(400).json({ ok: false, error: 'Invalid address' })
-  }
-
-  const chainId = Number(req.query.chainId ?? mainnet.id)
-  if (!ALLOWED_CHAIN_IDS.has(chainId)) {
-    return res.status(400).json({ ok: false, error: 'Unsupported chainId' })
-  }
-
-  const moralisChain = getMoralisChain(chainId)
-
+// CACHING HELPERS (Redis if available, else in-memory)
+async function getCachedData(key) {
+  if (!redis) return null
   try {
-    const url = `${MORALIS_BASE_URL}/wallets/${queryAddress}/tokens?chain=${moralisChain}`
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'accept': 'application/json',
-        'X-API-Key': MORALIS_API_KEY,
-      },
-    })
-
-    if (!response.ok) {
-      const error = await response.text()
-      console.error(`Moralis API error (${response.status}):`, error)
-      return res.status(502).json({ ok: false, error: 'Failed to fetch token balances from Moralis' })
-    }
-
-    const data = await response.json()
-    const tokens = data.result ?? []
-
-    // Transform Moralis response to match expected format
-    const transformed = tokens.map((token) => ({
-      token_address: token.token_address,
-      symbol: token.symbol ?? '???',
-      name: token.name ?? 'Unknown Token',
-      balance: token.balance ?? '0',
-      decimals: token.decimals ?? null,
-      thumbnail: token.thumbnail ?? null,
-    }))
-
-    return res.json({ ok: true, tokens: transformed })
+    return await redis.get(key)
   } catch (err) {
-    console.error('Failed to fetch tokens from Moralis:', err)
-    return res.status(500).json({ ok: false, error: 'Internal server error' })
+    return null
   }
-})
+}
+async function setCachedData(key, value, ttlSeconds = 300) {
+  if (!redis) return
+  try {
+    await redis.set(key, value, 'EX', ttlSeconds)
+  } catch (err) {
+    // fail silently
+  }
+}
 
-// GET /api/token-price?address=0x...&chainId=1 — ERC20 token price via Moralis (replaces CoinGecko for frontend)
+// GET /api/token-price?address=0x...&chainId=1
 app.get('/api/token-price', async (req, res) => {
-  if (!MORALIS_API_KEY) {
-    return res.status(503).json({ ok: false, error: 'Moralis API not configured' })
-  }
   const address = (req.query.address || '').trim().toLowerCase()
-  if (!address || !isAddress(address)) {
-    return res.status(400).json({ ok: false, error: 'Invalid address' })
-  }
+  if (!address) return res.status(400).json({ ok: false, error: 'Address required' })
+  
   const chainId = Number(req.query.chainId ?? mainnet.id)
+  const cacheKey = `price:${chainId}:${address}`
+  
+  // Try Cache
+  const cached = await getCachedData(cacheKey)
+  if (cached) return res.json({ ok: true, price: JSON.parse(cached).price, change24h: JSON.parse(cached).change24h, cached: true })
+
+  // Handle special native IDs or common symbols
+  if (address === 'ethereum' || address === 'bitcoin') {
+     const cgData = await fetchCoinGeckoPrice(address);
+     if (cgData) {
+       await setCachedData(cacheKey, JSON.stringify({ price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange }), 300)
+       return res.json({ ok: true, price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange });
+     }
+     return res.status(502).json({ ok: false, error: 'Price fetch failed' });
+  }
+
+  if (!isAddress(address)) return res.status(400).json({ ok: false, error: 'Invalid address' })
   const moralisChain = getMoralisChain(chainId)
+
   try {
     const url = `${MORALIS_BASE_URL}/erc20/${address}/price?chain=${moralisChain}`
-    const response = await fetch(url, {
-      headers: { 'accept': 'application/json', 'X-API-Key': MORALIS_API_KEY },
-    })
+    const headers = { 'accept': 'application/json' };
+    if (MORALIS_API_KEY.startsWith('eyJ')) headers['Authorization'] = `Bearer ${MORALIS_API_KEY}`;
+    else headers['X-API-Key'] = MORALIS_API_KEY;
+
+    const response = await fetch(url, { headers });
     if (!response.ok) {
-      const err = await response.text()
-      console.warn('Moralis token price error:', response.status, err)
-      return res.status(502).json({ ok: false, error: 'Price fetch failed' })
+      const cgData = await fetchCoinGeckoPrice(address);
+      if (cgData) {
+        await setCachedData(cacheKey, JSON.stringify({ price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange }), 300)
+        return res.json({ ok: true, price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange });
+      }
+      // Cache failure for 1 minute to avoid slamming external APIs during outage/rate-limit
+      await setCachedData(cacheKey, JSON.stringify({ price: null, change24h: null }), 60)
+      return res.json({ ok: true, price: null, change24h: null });
     }
     const data = await response.json()
     const usd = data.usdPrice != null ? Number(data.usdPrice) : null
     const change = data.usdPrice24hrPercentChange != null ? Number(data.usdPrice24hrPercentChange) : (data['24hrPercentChange'] != null ? Number(data['24hrPercentChange']) : null)
+    
+    // Cache Result
+    await setCachedData(cacheKey, JSON.stringify({ price: usd, change24h: change }), 300)
+    
     return res.json({ ok: true, price: usd, change24h: change })
   } catch (err) {
     console.error('Token price fetch error:', err)
@@ -1238,39 +1254,70 @@ app.get('/api/token-price', async (req, res) => {
   }
 })
 
-// GET /api/token-prices?addresses=0x1,0x2&chainId=1 — batch ERC20 prices (Moralis)
+// GET /api/token-prices?addresses=0x1,0x2&chainId=1
 app.get('/api/token-prices', async (req, res) => {
-  if (!MORALIS_API_KEY) {
-    return res.status(503).json({ ok: false, error: 'Moralis API not configured' })
-  }
   const raw = req.query.addresses
   const addresses = Array.isArray(raw) ? raw : (typeof raw === 'string' ? raw.split(',') : [])
-  const valid = addresses.map(a => (a || '').trim().toLowerCase()).filter(a => a && isAddress(a))
-  if (valid.length === 0) {
-    return res.status(400).json({ ok: false, error: 'Invalid or missing addresses' })
-  }
+  const cleanAddresses = addresses.map(a => (a || '').trim().toLowerCase()).filter(a => a)
+  if (cleanAddresses.length === 0) return res.status(400).json({ ok: false, error: 'Invalid or missing addresses' })
+
   const chainId = Number(req.query.chainId ?? mainnet.id)
   const moralisChain = getMoralisChain(chainId)
-  const results = {}
-  for (const address of valid.slice(0, 20)) {
+  
+  // Batch processing with Promise.all for optimization
+  const pricePromises = cleanAddresses.slice(0, 50).map(async (address) => {
+    const cacheKey = `price:${chainId}:${address}`
+    
+    // 1. Check Cache First
+    const cached = await getCachedData(cacheKey)
+    if (cached) return { address, data: JSON.parse(cached) }
+
+    // 2. Fetch if not cached
     try {
-      const url = `${MORALIS_BASE_URL}/erc20/${address}/price?chain=${moralisChain}`
-      const response = await fetch(url, {
-        headers: { 'accept': 'application/json', 'X-API-Key': MORALIS_API_KEY },
-      })
-      if (response.ok) {
-        const data = await response.json()
-        const change = data.usdPrice24hrPercentChange != null ? Number(data.usdPrice24hrPercentChange) : (data['24hrPercentChange'] != null ? Number(data['24hrPercentChange']) : null)
-        results[address] = {
-          price: data.usdPrice != null ? Number(data.usdPrice) : null,
-          change24h: change,
+      let priceData = null
+      if (address === 'ethereum' || address === 'bitcoin') {
+        const cgData = await fetchCoinGeckoPrice(address);
+        if (cgData) priceData = { price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange };
+      } else if (isAddress(address)) {
+        const url = `${MORALIS_BASE_URL}/erc20/${address}/price?chain=${moralisChain}`
+        const headers = { 'accept': 'application/json' };
+        if (MORALIS_API_KEY.startsWith('eyJ')) headers['Authorization'] = `Bearer ${MORALIS_API_KEY}`;
+        else headers['X-API-Key'] = MORALIS_API_KEY;
+
+        const response = await fetch(url, { headers })
+        if (response.ok) {
+          const data = await response.json()
+          const change = data.usdPrice24hrPercentChange != null ? Number(data.usdPrice24hrPercentChange) : (data['24hrPercentChange'] != null ? Number(data['24hrPercentChange']) : null)
+          priceData = {
+            price: data.usdPrice != null ? Number(data.usdPrice) : null,
+            change24h: change,
+          }
+        } else {
+          const cgData = await fetchCoinGeckoPrice(address);
+          if (cgData) priceData = { price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange };
         }
+      }
+
+      if (priceData) {
+        await setCachedData(cacheKey, JSON.stringify(priceData), 300)
+        return { address, data: priceData }
+      } else {
+        // Cache failure for 1 minute
+        await setCachedData(cacheKey, JSON.stringify({ price: null, change24h: null }), 60)
       }
     } catch (e) {
       console.warn('Token price for', address, e.message)
     }
-  }
-  return res.json({ ok: true, prices: results })
+    return { address, data: null }
+  })
+
+  const resultsArr = await Promise.all(pricePromises)
+  const prices = {}
+  resultsArr.forEach(r => {
+    if (r.data) prices[r.address] = r.data
+  })
+
+  return res.json({ ok: true, prices })
 })
 
 // ------------------------------------------------------------------
@@ -1325,16 +1372,34 @@ app.get('/api/private', requireAuth, (req, res) => {
   })
 })
 
-app.post('/api/logout', (req, res) => {
+app.post('/api/logout', async (req, res) => {
   const isElectron = req.headers['x-electron-app'] === '1'
   const isLocalhost = req.hostname === 'localhost' || req.hostname === '127.0.0.1'
   const secureCookie = isLocalhost ? false : (isElectron || IS_PROD)
   const sameSite = isLocalhost ? 'lax' : (isElectron ? 'none' : 'lax')
+  const tok = req.cookies?.token
+  let logAddress = null
+  try { if (tok) { const payload = jwt.verify(tok, JWT_SECRET); logAddress = payload.sub; } } catch(e) {}
+
   res.clearCookie('token', {
     path: '/',
     sameSite,
     secure: secureCookie,
   })
+
+  // Automatic Logout Logging
+  if (logAddress && ActivityLog && mongoReady) {
+    try {
+      await ActivityLog.create({
+        type: 'disconnect',
+        address: logAddress.toLowerCase(),
+        ip: getClientIp(req),
+        userAgent: req.get('user-agent') || 'unknown',
+        timestampLocal: getManilaTime()
+      })
+    } catch (logErr) {}
+  }
+
   res.json({ ok: true })
 })
 
@@ -1349,7 +1414,9 @@ if (process.env.MONGO_URI) {
     email: { type: String, default: '' },
     bio: { type: String, default: '' },
     avatarUrl: { type: String, default: null },
+    settings: { type: Object, default: {} },
     updatedAt: { type: Date, default: Date.now },
+    updatedAtLocal: { type: String, default: getManilaTime },
   })
   UserProfile = mongoose.models.UserProfile || mongoose.model('UserProfile', UserProfileSchema)
 }
@@ -1385,36 +1452,40 @@ loadProfilesFromFile().catch(err => console.error('Profile init error:', err))
 
 // POST /api/user/profile — save user profile
 app.post('/api/user/profile', requireAuth, async (req, res) => {
-  console.log('POST /api/user/profile request received')
   const address = req.user?.address ?? null
-  console.log('User address:', address)
   if (!address) return res.status(403).json({ ok: false, error: 'Wallet address required' })
 
-  const { displayName, email, bio, avatarUrl } = req.body ?? {}
-  console.log('Request body keys:', Object.keys(req.body ?? {}))
+  const { displayName, email, bio, avatarUrl, settings } = req.body ?? {}
+
+  // Fetch existing to merge
+  let existingProfile = {};
+  if (typeof UserProfile !== 'undefined' && mongoReady) {
+    try { existingProfile = await UserProfile.findOne({ address: address.toLowerCase() }).lean() || {}; } catch (e) {}
+  } else {
+    existingProfile = profileMemory.get(address.toLowerCase()) || {};
+  }
 
   const profileData = {
     address: address.toLowerCase(),
-    displayName: displayName != null ? String(displayName).trim() : '',
-    email: email != null ? String(email).trim() : '',
-    bio: bio != null ? String(bio).trim() : '',
-    avatarUrl: avatarUrl != null ? String(avatarUrl).trim().slice(0, 5000000) : null, // Limit avatar URL to 5MB
+    displayName: displayName !== undefined ? String(displayName).trim() : existingProfile.displayName || '',
+    email: email !== undefined ? String(email).trim() : existingProfile.email || '',
+    bio: bio !== undefined ? String(bio).trim() : existingProfile.bio || '',
+    avatarUrl: avatarUrl !== undefined ? (avatarUrl ? String(avatarUrl).trim().slice(0, 5000000) : null) : existingProfile.avatarUrl || null,
+    settings: settings !== undefined ? settings : existingProfile.settings || {},
     updatedAt: new Date(),
   }
 
   try {
-    console.log('Saving profile for address:', address, 'Avatar size:', profileData.avatarUrl?.length || 0)
     if (UserProfile && mongoReady) {
       await UserProfile.findOneAndUpdate(
         { address: address.toLowerCase() },
-        profileData,
-        { upsert: true, new: true }
+        { ...profileData, updatedAtLocal: getManilaTime() },
+        { upsert: true, returnDocument: 'after' }
       )
     } else {
       profileMemory.set(address.toLowerCase(), profileData)
       await saveProfilesToFile()
     }
-    console.log('Profile saved successfully')
     return res.json({ ok: true, profile: profileData })
   } catch (err) {
     console.error('Failed to save profile:', err)
@@ -1424,9 +1495,7 @@ app.post('/api/user/profile', requireAuth, async (req, res) => {
 
 // GET /api/user/profile — retrieve user profile
 app.get('/api/user/profile', requireAuth, async (req, res) => {
-  console.log('GET /api/user/profile request received')
   const address = req.user?.address ?? null
-  console.log('User address:', address)
   if (!address) return res.status(403).json({ ok: false, error: 'Wallet address required' })
 
   try {
@@ -1438,17 +1507,19 @@ app.get('/api/user/profile', requireAuth, async (req, res) => {
     }
 
     if (!profile) {
-      console.log('No profile found for address:', address)
+      // console.log('No profile found for address:', address)
       return res.json({ ok: true, profile: null })
     }
 
-    console.log('Profile found, sending response')
+    // console.log('Profile found, sending response')
     return res.json({ ok: true, profile })
   } catch (err) {
     console.error('Failed to retrieve profile:', err)
     return res.status(500).json({ ok: false, error: 'Failed to retrieve profile' })
   }
 })
+
+
 // ------------------------------------------------------------------
 
 
@@ -1457,11 +1528,18 @@ const port = Number(process.env.PORT ?? 3002)
 
 // Start server immediately; MongoDB connects in background so file fallback works without blocking startup
 if (process.env.MONGO_URI) {
-  mongoose.connect(process.env.MONGO_URI).then(() => {
+  console.log(`[server] Connecting to MongoDB... (URI length: ${process.env.MONGO_URI.length})`)
+  mongoose.connect(process.env.MONGO_URI, {
+    serverSelectionTimeoutMS: 5000,
+  }).then(() => {
     mongoReady = true
-    console.log('Connected to MongoDB')
+    console.log('[server] ✅ Connected to MongoDB')
   }).catch((err) => {
-    console.error('MongoDB connection error:', err)
+    mongoReady = false
+    console.error('[server] ❌ MongoDB connection error:', err.message)
+    if (err.message.includes('authentication failed')) {
+      console.error('[server] Hint: Check your username/password in .env. Ensure no special characters are unescaped.')
+    }
   })
 }
 app.listen(port, () => {

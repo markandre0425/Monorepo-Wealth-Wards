@@ -55,6 +55,7 @@ export interface TransactionItem {
   id: string;
   type: string;
   address: string;
+  kind?: string;
   chainId?: number;
   txHash?: string;
   fromAddress?: string;
@@ -80,9 +81,17 @@ export async function getBalanceFromBackend(chainId = 1): Promise<BalanceRespons
   return fetchApi<BalanceResponse>(`/api/balance?chainId=${chainId}`);
 }
 
-/** Get ERC-20 token assets for the authenticated wallet (Alchemy). */
-export async function getAssetsFromBackend(address: string, chainId = 1): Promise<AssetsResponse> {
-  return fetchApi<AssetsResponse>(`/api/assets?address=${encodeURIComponent(address)}&chainId=${chainId}`);
+/** Get ERC-20 token assets from backend deep discovery endpoint. */
+export async function getAssetsFromBackend(address: string, chainId: number = 1): Promise<{ ok: boolean; assets: any[] }> {
+  try {
+    const url = `${getApiBase()}/api/all-assets?address=${encodeURIComponent(address)}&chainId=${chainId}`;
+    const res = await fetch(url, { credentials: "include" });
+    if (!res.ok) throw new Error(`Backend assets fetch failed with status ${res.status}`);
+    return await res.json();
+  } catch (error) {
+    console.error("getAssetsFromBackend error:", error);
+    return { ok: false, assets: [] };
+  }
 }
 
 /** Get transaction log for the authenticated user. */

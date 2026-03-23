@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { toast } from "sonner";
 import { useTheme, themeColors } from "./theme-context";
 import { Button, PrimaryButton } from "./button-styles";
+import { useUserProfile } from "./user-profile-context";
 
 function ToggleSwitch({ enabled, onToggle }: { enabled: boolean; onToggle: () => void }) {
   return (
@@ -22,15 +23,38 @@ function ToggleSwitch({ enabled, onToggle }: { enabled: boolean; onToggle: () =>
 export function SettingsPage() {
   const { isDark, toggleTheme } = useTheme();
   const tc = themeColors(isDark);
-  const [notifications, setNotifications] = useState(true);
-  const [twoFA, setTwoFA] = useState(false);
-  const [autoLock, setAutoLock] = useState(true);
+  const { profile, updateProfile, isConnected } = useUserProfile();
+  
   const [currency, setCurrency] = useState("USD");
   const [language, setLanguage] = useState("English");
-  const [slippage, setSlippage] = useState("0.5");
+  const [saving, setSaving] = useState(false);
 
-  const handleSave = () => {
-    toast.success("Settings saved successfully!");
+  useEffect(() => {
+    if (profile.settings) {
+      setCurrency(profile.settings.currency || "USD");
+      setLanguage(profile.settings.language || "English");
+    }
+  }, [profile]);
+
+  const handleSave = async () => {
+    if (!isConnected) {
+      toast.error("Please connect your wallet to save settings.");
+      return;
+    }
+    setSaving(true);
+    try {
+      await updateProfile({
+        settings: {
+          currency,
+          language,
+        }
+      });
+      toast.success("Settings saved successfully!");
+    } catch (err) {
+      toast.error("Failed to save settings.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -104,112 +128,9 @@ export function SettingsPage() {
           </div>
         </div>
 
-        {/* Security Settings */}
-        <div
-          className="backdrop-blur-[10px] rounded-[16px] p-[24px] transition-colors duration-300"
-          style={{ backgroundColor: tc.cardBg, border: `1px solid ${tc.cardBorder}` }}
-        >
-          <h2 className="font-['Inter',sans-serif] font-bold text-[24px] mb-[24px]" style={{ color: tc.textPrimary }}>Security</h2>
-          <div className="flex flex-col gap-[20px]">
-            {/* Notifications */}
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="font-['Inter',sans-serif] font-medium text-[16px]" style={{ color: tc.textPrimary }}>Push Notifications</p>
-                <p className="font-['Inter',sans-serif] font-normal text-[14px]" style={{ color: tc.textSecondary }}>Get alerts for transactions and price changes</p>
-              </div>
-              <ToggleSwitch
-                enabled={notifications}
-                onToggle={() => {
-                  setNotifications(!notifications);
-                  toast(`Notifications ${!notifications ? "enabled" : "disabled"}`);
-                }}
-              />
-            </div>
-
-            {/* 2FA */}
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="font-['Inter',sans-serif] font-medium text-[16px]" style={{ color: tc.textPrimary }}>Two-Factor Authentication</p>
-                <p className="font-['Inter',sans-serif] font-normal text-[14px]" style={{ color: tc.textSecondary }}>Add an extra layer of security</p>
-              </div>
-              <ToggleSwitch
-                enabled={twoFA}
-                onToggle={() => {
-                  setTwoFA(!twoFA);
-                  toast(`2FA ${!twoFA ? "enabled" : "disabled"}`);
-                }}
-              />
-            </div>
-
-            {/* Auto Lock */}
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="font-['Inter',sans-serif] font-medium text-[16px]" style={{ color: tc.textPrimary }}>Auto-Lock Wallet</p>
-                <p className="font-['Inter',sans-serif] font-normal text-[14px]" style={{ color: tc.textSecondary }}>Lock wallet after 5 minutes of inactivity</p>
-              </div>
-              <ToggleSwitch
-                enabled={autoLock}
-                onToggle={() => {
-                  setAutoLock(!autoLock);
-                  toast(`Auto-lock ${!autoLock ? "enabled" : "disabled"}`);
-                }}
-              />
-            </div>
-          </div>
-        </div>
-
-        {/* Network Settings */}
-        <div
-          className="backdrop-blur-[10px] rounded-[16px] p-[24px] transition-colors duration-300"
-          style={{ backgroundColor: tc.cardBg, border: `1px solid ${tc.cardBorder}` }}
-        >
-          <h2 className="font-['Inter',sans-serif] font-bold text-[24px] mb-[24px]" style={{ color: tc.textPrimary }}>Network & Trading</h2>
-          <div className="flex flex-col gap-[20px]">
-            {/* Slippage */}
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="font-['Inter',sans-serif] font-medium text-[16px]" style={{ color: tc.textPrimary }}>Slippage Tolerance</p>
-                <p className="font-['Inter',sans-serif] font-normal text-[14px]" style={{ color: tc.textSecondary }}>Maximum price change during swap</p>
-              </div>
-              <div className="flex items-center gap-[8px]">
-                {["0.1", "0.5", "1.0"].map((val) => (
-                  <Button
-                    key={val}
-                    onClick={() => {
-                      setSlippage(val);
-                      toast(`Slippage set to ${val}%`);
-                    }}
-                    size="sm"
-                    variant={slippage === val ? "gradient-primary" : "primary"}
-                  >
-                    {val}%
-                  </Button>
-                ))}
-              </div>
-            </div>
-
-            {/* Default Network */}
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="font-['Inter',sans-serif] font-medium text-[16px]" style={{ color: tc.textPrimary }}>Default Network</p>
-                <p className="font-['Inter',sans-serif] font-normal text-[14px]" style={{ color: tc.textSecondary }}>Preferred blockchain network</p>
-              </div>
-              <select
-                className="rounded-[12px] px-[16px] py-[8px] font-['Inter',sans-serif] text-[14px] outline-none cursor-pointer transition-colors duration-300"
-                style={{ backgroundColor: tc.selectBg, color: tc.textPrimary }}
-              >
-                <option>Ethereum Mainnet</option>
-                <option>Polygon</option>
-                <option>Arbitrum</option>
-                <option>Optimism</option>
-              </select>
-            </div>
-          </div>
-        </div>
-
         {/* Save button */}
-        <PrimaryButton onClick={handleSave} size="lg" className="self-start">
-          Save Settings
+        <PrimaryButton onClick={handleSave} size="lg" className="self-start" disabled={saving}>
+          {saving ? "Saving..." : "Save Settings"}
         </PrimaryButton>
       </div>
     </div>

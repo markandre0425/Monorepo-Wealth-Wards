@@ -19,10 +19,15 @@ async function handleSiweFlow(address: string) {
   }
   siweInProgressCount++;
   console.log("3. SIWE Flow Started for:", address);
-  
+
   try {
     const msgData = await WagmiAPI.getSiweMessage(address);
     console.log("4. Message Received from Backend:", msgData);
+
+    if (!msgData.ok || !msgData.message) {
+      console.error("Failed to get SIWE message from backend:", msgData);
+      return;
+    }
 
     console.log("5a. Requesting signature from wallet...");
     const signature = await signMessage(config, { message: msgData.message });
@@ -175,7 +180,7 @@ function App() {
       async onChange(connections) {
         if (connections.length > 0 && siweInProgressCount === 0) {
           const address = connections[0].accounts[0];
-          
+
           console.info("[App] Wallet connected, checking session for:", address);
           // Check if we ALREADY have a session for this address to avoid redirect loops
           const session = await WagmiAPI.getWalletSession();
@@ -231,7 +236,7 @@ function App() {
           Be the first to know when we launch.
         </p> */}
 
-        <button onClick = {loginHandler} className = "connect-dashboard-btn">
+        <button onClick={loginHandler} className="connect-dashboard-btn">
           {IS_ELECTRON ? "Connect Wallet" : "Connect MetaMask"}
         </button>
 

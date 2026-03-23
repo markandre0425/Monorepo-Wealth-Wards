@@ -32,6 +32,7 @@ const figmaAssetPlugin = {
 // In dev (serve): use /dashboard/ so app is at http://localhost:3001/dashboard/
 export default defineConfig(({ command }) => ({
   base: process.env.BASE_URL ?? (command === 'serve' ? '/dashboard/' : '/'),
+  envDir: '../../',
   plugins: [
     figmaAssetPlugin,
     react(),
@@ -40,7 +41,19 @@ export default defineConfig(({ command }) => ({
     {
       name: 'serve-avatar-under-base',
       configureServer(server) {
-        const base = (process.env.BASE_URL ?? '/dashboard/').replace(/\/$/, '')
+        const base = process.env.BASE_URL || '/dashboard/'
+        
+        // Redirect root / to /dashboard/ for convenience
+        server.middlewares.use((req, res, next) => {
+          if (req.url === '/' || req.url === '') {
+            const redirectTarget = base.endsWith('/') ? base : base + '/'
+            res.writeHead(302, { Location: redirectTarget })
+            res.end()
+            return
+          }
+          next()
+        })
+
         const prefix = base + '/avatar/'
         const handle = async (req: any, res: any, next: () => void) => {
           const url = req.url?.split('?')[0]
@@ -73,6 +86,10 @@ export default defineConfig(({ command }) => ({
         target: 'https://api.coingecko.com/api/v3',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api\/coingecko/, ''),
+      },
+      '/api/': {
+        target: 'http://localhost:3002',
+        changeOrigin: true,
       },
     },
   },

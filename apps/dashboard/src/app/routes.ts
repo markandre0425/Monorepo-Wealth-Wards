@@ -9,7 +9,7 @@ import { getWalletSession } from "./services/wagmi-api";
 
 // When served under /dashboard/ (dev proxy or prod), router needs basename so path "/dashboard/" matches route "/"
 const base = (typeof import.meta.env?.BASE_URL === "string" && import.meta.env.BASE_URL !== "/" && import.meta.env.BASE_URL !== "./")
-  ? import.meta.env.BASE_URL.replace(/\/$/, "")
+  ? import.meta.env.BASE_URL
   : undefined;
 
 function getLandingRedirectUrl(): string {
@@ -19,10 +19,10 @@ function getLandingRedirectUrl(): string {
 
 /** Route guard: redirect to landing if user is not logged in (no valid SIWE session). */
 async function requireAuthLoader() {
-  console.log("[Dashboard] requireAuthLoader checking session...");
+  // console.log("[Dashboard] requireAuthLoader checking session...");
   try {
     const session = await getWalletSession();
-    console.log("[Dashboard] Session response:", session);
+    // console.log("[Dashboard] Session response:", session);
     if (!session?.ok || !session?.address) {
       console.warn("[Dashboard] Not authenticated, redirecting to landing...");
       return redirect(getLandingRedirectUrl());
@@ -48,12 +48,17 @@ function RouteError() {
   );
 }
 
+function HydrateFallback() {
+  return React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", backgroundColor: "#020817", color: "white" } }, "Loading Dashboard...");
+}
+
 export const router = createBrowserRouter(
   [
     {
       path: "/",
       Component: RootLayout,
       loader: requireAuthLoader,
+      HydrateFallback,
       errorElement: React.createElement(RouteError),
       children: [
         { index: true, Component: DashboardPage },

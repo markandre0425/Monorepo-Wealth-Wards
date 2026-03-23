@@ -4,6 +4,8 @@ import { EthLogo, ChevronDownIcon } from "./shared-icons";
 import { PrimaryButton, SecondaryButton } from "./button-styles";
 import { useUserProfile, DEFAULT_PROFILE, BASE } from "./user-profile-context";
 import { useWagmiSession } from "../hooks/useWagmiSession";
+import { usePortfolio } from "./portfolio-context";
+import { getTransactionsFromBackend } from "../services/wagmi-api";
 
 // Avatar options from public/avatar (base-relative for /dashboard/)
 const DEFAULT_AVATARS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => `${BASE}avatar/avatar${n}.jpg`);
@@ -21,6 +23,19 @@ export function ProfilePage() {
   const [showAvatarPicker, setShowAvatarPicker] = useState(false);
   const [uploading, setUploading] = useState(false);
 
+  const portfolioData = usePortfolio();
+  const [recentActivity, setRecentActivity] = useState<any[]>([]);
+
+  useEffect(() => {
+    if (walletConnected) {
+      getTransactionsFromBackend(10).then((res) => {
+        if (res.ok && res.transactions) {
+          setRecentActivity(res.transactions);
+        }
+      });
+    }
+  }, [walletConnected]);
+
   useEffect(() => {
     fetchProfile();
   }, [fetchProfile]);
@@ -36,18 +51,15 @@ export function ProfilePage() {
     }
   }, [profile]);
 
-  const wallets = [
-    { network: "Ethereum", address: "0x7a3F...9c2E", balance: "12.45 ETH", usd: "$ 35,467.94" },
-    { network: "Bitcoin", address: "bc1q8...k3mf", balance: "0.892 BTC", usd: "$ 56,639.57" },
-    { network: "Polygon", address: "0x4b2D...7f1A", balance: "8,420 MATIC", usd: "$ 5,894.00" },
-  ];
-
-  const recentActivity = [
-    { action: "Received", amount: "2.5 ETH", from: "0x9d2F...4a1B", time: "2 hours ago", type: "in" as const },
-    { action: "Sent", amount: "0.1 BTC", from: "bc1q3...m8nf", time: "5 hours ago", type: "out" as const },
-    { action: "Swapped", amount: "1.2 ETH → 3,200 USDC", from: "Uniswap V2", time: "1 day ago", type: "swap" as const },
-    { action: "Received", amount: "500 CSCS", from: "Staking Rewards", time: "2 days ago", type: "in" as const },
-  ];
+  // Build single wallet object if connected
+  const wallets = walletConnected && address ? [
+    { 
+      network: "Ethereum", 
+      address: `${address.slice(0, 6)}...${address.slice(-4)}`, 
+      balance: `${portfolioData.ethHoldings.toFixed(4)} ETH`, 
+      usd: `$ ${(portfolioData.ethHoldings * portfolioData.ethPrice).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` 
+    }
+  ] : [];
 
   const handleSave = async () => {
     try {
@@ -240,16 +252,22 @@ export function ProfilePage() {
               )}
               <div className="flex gap-[24px] mt-[16px]">
                 <div>
-                  <p className="font-['Inter',sans-serif] font-bold text-[20px] text-white">$ 97,901.51</p>
+                  <p className="font-['Inter',sans-serif] font-bold text-[20px] text-white">
+                    {portfolioData.loading || !walletConnected ? "—" : `$ ${portfolioData.balance.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}
+                  </p>
                   <p className="font-['Inter',sans-serif] font-normal text-[12px] text-[#86909c]">Total Portfolio</p>
                 </div>
                 <div>
-                  <p className="font-['Inter',sans-serif] font-bold text-[20px] text-[#00ffa3]">+12.3%</p>
-                  <p className="font-['Inter',sans-serif] font-normal text-[12px] text-[#86909c]">30d Change</p>
+                  <p className="font-['Inter',sans-serif] font-bold text-[20px] text-white">
+                    {portfolioData.loading || !walletConnected ? "—" : portfolioData.assets.length}
+                  </p>
+                  <p className="font-['Inter',sans-serif] font-normal text-[12px] text-[#86909c]">Assets</p>
                 </div>
                 <div>
-                  <p className="font-['Inter',sans-serif] font-bold text-[20px] text-white">47</p>
-                  <p className="font-['Inter',sans-serif] font-normal text-[12px] text-[#86909c]">Transactions</p>
+                  <p className="font-['Inter',sans-serif] font-bold text-[20px] text-white">
+                    {!walletConnected ? "—" : recentActivity.length}
+                  </p>
+                  <p className="font-['Inter',sans-serif] font-normal text-[12px] text-[#86909c]">Recent Transactions</p>
                 </div>
               </div>
             </div>
@@ -290,33 +308,38 @@ export function ProfilePage() {
         <div className="backdrop-blur-[10px] bg-[#1c1c1c]/60 rounded-[16px] p-[24px]">
           <h2 className="font-['Inter',sans-serif] font-bold text-[24px] text-white mb-[20px]">Recent Activity</h2>
           <div className="flex flex-col gap-[12px]">
-            {recentActivity.map((activity, i) => (
-              <div key={i} className="flex items-center justify-between bg-[#2b2b2b]/50 rounded-[12px] px-[16px] py-[12px]">
-                <div className="flex items-center gap-[12px]">
-                  <div
-                    className={`size-[36px] rounded-full flex items-center justify-center text-[16px] ${
-                      activity.type === "in"
-                        ? "bg-[#00ffa3]/20"
-                        : activity.type === "out"
-                        ? "bg-[#fb035c]/20"
-                        : "bg-[rgba(0,170,255,0.2)]"
-                    }`}
-                  >
-                    {activity.type === "in" ? "↓" : activity.type === "out" ? "↑" : "⇆"}
+            {recentActivity.length === 0 ? (
+              <p className="text-white/40 text-sm">No recent activity found.</p>
+            ) : (
+              recentActivity.map((activity, i) => {
+                const isOut = activity.direction === 'out';
+                return (
+                  <div key={i} className="flex items-center justify-between bg-[#2b2b2b]/50 rounded-[12px] px-[16px] py-[12px]">
+                    <div className="flex items-center gap-[12px]">
+                      <div
+                        className={`size-[36px] rounded-full flex items-center justify-center text-[16px] ${
+                          isOut
+                            ? "bg-[#fb035c]/20"
+                            : "bg-[#00ffa3]/20"
+                        }`}
+                      >
+                        {isOut ? "↑" : "↓"}
+                      </div>
+                      <div>
+                        <p className="font-['Inter',sans-serif] font-medium text-[16px] text-white">{isOut ? "Sent" : "Received"}</p>
+                        <p className="font-['Inter',sans-serif] font-normal text-[12px] text-[#86909c]">{activity.type}</p>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <p className={`font-['Inter',sans-serif] font-semibold text-[16px] ${isOut ? "text-[#fb035c]" : "text-[#00ffa3]"}`}>
+                        {isOut ? "-" : "+"}{activity.value}
+                      </p>
+                      <p className="font-['Inter',sans-serif] font-normal text-[12px] text-[#86909c]">{new Date(activity.timestamp).toLocaleDateString()}</p>
+                    </div>
                   </div>
-                  <div>
-                    <p className="font-['Inter',sans-serif] font-medium text-[16px] text-white">{activity.action}</p>
-                    <p className="font-['Inter',sans-serif] font-normal text-[12px] text-[#86909c]">{activity.from}</p>
-                  </div>
-                </div>
-                <div className="text-right">
-                  <p className={`font-['Inter',sans-serif] font-semibold text-[16px] ${activity.type === "in" ? "text-[#00ffa3]" : activity.type === "out" ? "text-[#fb035c]" : "text-white"}`}>
-                    {activity.type === "in" ? "+" : activity.type === "out" ? "-" : ""}{activity.amount}
-                  </p>
-                  <p className="font-['Inter',sans-serif] font-normal text-[12px] text-[#86909c]">{activity.time}</p>
-                </div>
-              </div>
-            ))}
+                );
+              })
+            )}
           </div>
         </div>
       </div>

@@ -3,6 +3,7 @@ import { Toaster } from "sonner";
 import { router } from "./routes";
 import { ThemeProvider, useTheme } from "./components/theme-context";
 import { UserProfileProvider } from "./components/user-profile-context";
+import { PortfolioProvider } from "./components/portfolio-context";
 import { RouterProvider} from "react-router";
 
 function AppInner() {
@@ -27,11 +28,13 @@ function AppInner() {
 
 
 export default function App() {
-  console.log("[Dashboard] App component rendering...");
+  // console.log("[Dashboard] App component rendering...");
   return (
     <ThemeProvider>
       <UserProfileProvider>
-        <AppInner />
+        <PortfolioProvider>
+          <AppInner />
+        </PortfolioProvider>
       </UserProfileProvider>
     </ThemeProvider>
   );

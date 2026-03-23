@@ -25,7 +25,11 @@ import { useUserProfile, DEFAULT_AVATAR_PATH } from "./user-profile-context";
 import { Button, PrimaryButton, SecondaryButton } from "./button-styles";
 import { BlockchainAPI } from "../services/blockchain-api";
 import { useWagmiSession } from "../hooks/useWagmiSession";
+import { usePortfolio, type PortfolioData } from "./portfolio-context";
 import { getBalanceFromBackend, getAssetsFromBackend, getApiBase } from "../services/wagmi-api";
+import { Address } from "./Address";
+import { AddressInput } from "./AddressInput";
+import scaffoldConfig from "../scaffold.config";
 
 /* CoinGecko API hook */
 
@@ -150,10 +154,10 @@ function useCryptoPrices(range: TimeRange) {
       const result = await response.json();
       const prices = result.prices;
 
-      const currentEth = prices["ethereum"]?.price || 2847.23;
-      const currentBtc = prices["bitcoin"]?.price || 63542.12;
-      const currentCscs = prices[CSCS_CONTRACT.toLowerCase()]?.price || 1.0;
-      const currentCscr = prices[CSCR_CONTRACT.toLowerCase()]?.price || 0.5;
+      const currentEth = prices["ethereum"]?.price || 0;
+      const currentBtc = prices["bitcoin"]?.price || 0;
+      const currentCscs = prices[CSCS_CONTRACT.toLowerCase()]?.price || 0;
+      const currentCscr = prices[CSCR_CONTRACT.toLowerCase()]?.price || 0;
 
       setEthPrice(currentEth);
       setBtcPrice(currentBtc);
@@ -193,7 +197,7 @@ function CustomTooltip({ active, payload, label }: any) {
 
 /* Stats row */
 
-const ETH_RPC = "https://rpc.ankr.com/eth";
+const ETH_RPC = scaffoldConfig.targetNetworks[0].rpcUrls.default.http[0];
 
 // ERC20 balanceOf(address) selector
 const BALANCE_OF_SELECTOR = "0x70a08231";
@@ -278,13 +282,13 @@ function usePortfolioData(walletAddress: string | null) {
         ).catch(() => null),
       ]);
 
-      let ethPrice = 2847.23;
-      let priceChange30d = 12.3;
+      let ethPrice = 0;
+      let priceChange30d = 0;
 
       if (coinRes && coinRes.ok) {
         const coin = await coinRes.json();
-        ethPrice = coin.market_data?.current_price?.usd ?? 2847.23;
-        priceChange30d = coin.market_data?.price_change_percentage_30d ?? 12.3;
+        ethPrice = coin.market_data?.current_price?.usd ?? 0;
+        priceChange30d = coin.market_data?.price_change_percentage_30d ?? 0;
       }
 
       // Fetch CSCS/CSCR prices from CoinGecko contract endpoints
@@ -359,6 +363,7 @@ function usePortfolioData(walletAddress: string | null) {
 
 /** Portfolio data from Wagmi backend (/api/balance + /api/assets). Use when user is logged in via /app/. */
 function usePortfolioFromBackend(address: string | null) {
+
   const [data, setData] = useState({
     balance: 0,
     savings: 0,
@@ -369,6 +374,7 @@ function usePortfolioFromBackend(address: string | null) {
     cscsHoldings: 0,
     cscrHoldings: 0,
     loading: true,
+    assets: [] as any[],
   });
 
   useEffect(() => {
@@ -383,6 +389,7 @@ function usePortfolioFromBackend(address: string | null) {
         cscsHoldings: 0,
         cscrHoldings: 0,
         loading: false,
+        assets: [],
       });
       return;
     }
@@ -411,7 +418,7 @@ function usePortfolioFromBackend(address: string | null) {
         const cscrLower = CSCR_CONTRACT.toLowerCase();
         let cscsHoldings = 0;
         let cscrHoldings = 0;
-        const contractAddresses = assets.map((a) => a.contractAddress).filter(Boolean) as string[];
+        const contractAddresses = assets.map((a: any) => a.contractAddress).filter(Boolean) as string[];
 
         for (const a of assets) {
           const bal = a.balance != null ? parseFloat(a.balance) : 0;
@@ -419,12 +426,12 @@ function usePortfolioFromBackend(address: string | null) {
           if (a.contractAddress?.toLowerCase() === cscrLower) cscrHoldings = bal;
         }
 
-        let ethPrice = 2847.23;
+        let ethPrice = 0;
         try {
           const priceRes = await BlockchainAPI.getTokenPrice("ethereum");
           if (priceRes?.price != null) ethPrice = priceRes.price;
         } catch {
-          // keep default
+          // keep 0
         }
 
         let totalUSD = balanceEth * ethPrice;
@@ -461,6 +468,7 @@ function usePortfolioFromBackend(address: string | null) {
           cscsHoldings,
           cscrHoldings,
           loading: false,
+          assets,
         });
       } catch {
         if (!cancelled) {
@@ -474,6 +482,7 @@ function usePortfolioFromBackend(address: string | null) {
             cscsHoldings: 0,
             cscrHoldings: 0,
             loading: false,
+            assets: [],
           });
         }
       }
@@ -493,41 +502,47 @@ function formatUsd(value: number) {
 }
 
 function StatsRow({ savings, rewards, apy, loading }: { savings: number; rewards: number; apy: number; loading: boolean }) {
+  const { isDark } = useTheme();
+  const statBg = isDark ? 'bg-[rgba(176,176,176,0.1)]' : 'bg-[rgba(79,70,229,0.07)]';
+  const statText = isDark ? 'text-white' : 'text-foreground';
+  const statMuted = isDark ? 'text-white/70' : 'text-muted-foreground';
+  const skeletonBg = isDark ? 'bg-white/10' : 'bg-foreground/10';
+
   return (
     <div className="grid grid-cols-1 sm:grid-cols-3 gap-[12px] sm:gap-[20px] w-full">
-      <div className="flex items-center gap-[12px] bg-[rgba(176,176,176,0.1)] rounded-[14px] px-[12px] sm:px-[16px] py-[10px] min-w-0">
-        <MoneysIcon />
+      <div className={`flex items-center gap-[12px] ${statBg} rounded-[14px] px-[12px] sm:px-[16px] py-[10px] min-w-0`}>
+        <MoneysIcon isDark={isDark} />
         <div className="min-w-0">
-          <p className="font-['Inter',sans-serif] font-medium text-[12px] sm:text-[14px] text-white">SAVINGS</p>
-          <p className="font-['Inter',sans-serif] font-bold text-[18px] sm:text-[24px] text-white uppercase truncate">
+          <p className={`font-['Inter',sans-serif] font-medium text-[12px] sm:text-[14px] ${statMuted}`}>SAVINGS</p>
+          <p className={`font-['Inter',sans-serif] font-bold text-[18px] sm:text-[24px] ${statText} uppercase truncate`}>
             {loading ? (
-              <span className="inline-block w-[60px] sm:w-[80px] h-[20px] sm:h-[24px] bg-white/10 rounded animate-pulse" />
+              <span className={`inline-block w-[60px] sm:w-[80px] h-[20px] sm:h-[24px] ${skeletonBg} rounded animate-pulse`} />
             ) : (
               `$ ${formatUsd(savings)}`
             )}
           </p>
         </div>
       </div>
-      <div className="flex items-center gap-[12px] bg-[rgba(176,176,176,0.1)] rounded-[14px] px-[12px] sm:px-[16px] py-[10px] min-w-0">
-        <WalletMoneyIcon />
+      <div className={`flex items-center gap-[12px] ${statBg} rounded-[14px] px-[12px] sm:px-[16px] py-[10px] min-w-0`}>
+        <WalletMoneyIcon isDark={isDark} />
         <div className="min-w-0">
-          <p className="font-['Inter',sans-serif] font-medium text-[12px] sm:text-[14px] text-white">REWARDS</p>
-          <p className="font-['Inter',sans-serif] font-bold text-[18px] sm:text-[24px] text-white uppercase truncate">
+          <p className={`font-['Inter',sans-serif] font-medium text-[12px] sm:text-[14px] ${statMuted}`}>REWARDS</p>
+          <p className={`font-['Inter',sans-serif] font-bold text-[18px] sm:text-[24px] ${statText} uppercase truncate`}>
             {loading ? (
-              <span className="inline-block w-[60px] sm:w-[80px] h-[20px] sm:h-[24px] bg-white/10 rounded animate-pulse" />
+              <span className={`inline-block w-[60px] sm:w-[80px] h-[20px] sm:h-[24px] ${skeletonBg} rounded animate-pulse`} />
             ) : (
               `$ ${formatUsd(rewards)}`
             )}
           </p>
         </div>
       </div>
-      <div className="flex items-center gap-[12px] bg-[rgba(176,176,176,0.1)] rounded-[14px] px-[12px] sm:px-[16px] py-[10px] min-w-0">
-        <ChartSquareIcon />
+      <div className={`flex items-center gap-[12px] ${statBg} rounded-[14px] px-[12px] sm:px-[16px] py-[10px] min-w-0`}>
+        <ChartSquareIcon isDark={isDark} />
         <div className="min-w-0">
-          <p className="font-['Inter',sans-serif] font-medium text-[12px] sm:text-[14px] text-white">APY</p>
-          <p className="font-['Inter',sans-serif] font-bold text-[18px] sm:text-[24px] text-white uppercase">
+          <p className={`font-['Inter',sans-serif] font-medium text-[12px] sm:text-[14px] ${statMuted}`}>APY</p>
+          <p className={`font-['Inter',sans-serif] font-bold text-[18px] sm:text-[24px] ${statText} uppercase`}>
             {loading ? (
-              <span className="inline-block w-[40px] sm:w-[60px] h-[20px] sm:h-[24px] bg-white/10 rounded animate-pulse" />
+              <span className={`inline-block w-[40px] sm:w-[60px] h-[20px] sm:h-[24px] ${skeletonBg} rounded animate-pulse`} />
             ) : (
               `+ ${apy.toFixed(1)}%`
             )}
@@ -543,6 +558,14 @@ function StatsRow({ savings, rewards, apy, loading }: { savings: number; rewards
 function PriceChart() {
   const [range, setRange] = useState<TimeRange>("30");
   const { data, loading, ethPrice, ethChange, refetch } = useCryptoPrices(range);
+  const { isDark } = useTheme();
+
+  const gridColor = isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.06)';
+  const axisLineColor = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)';
+  const activeDotFill = isDark ? '#1c1c1c' : '#ffffff';
+  const btnBarBg = isDark ? 'bg-[#2b2b2b]' : 'bg-[rgba(0,0,0,0.06)]';
+
+  const safeEthChange = isNaN(ethChange) ? 0 : ethChange;
 
   const ranges: { label: string; value: TimeRange }[] = [
     { label: "24H", value: "1" },
@@ -574,12 +597,12 @@ function PriceChart() {
             <span className="font-['Inter',sans-serif] text-[12px] text-[#86909c]">CSCR (scaled)</span>
           </div>
           {!loading && (
-            <span className={`font-['Inter',sans-serif] text-[12px] ${ethChange >= 0 ? "text-[#00ffa3]" : "text-[#fb035c]"}`}>
-              {ethChange >= 0 ? "+" : ""}{ethChange.toFixed(2)}%
+            <span className={`font-['Inter',sans-serif] text-[12px] ${safeEthChange >= 0 ? "text-[#00ffa3]" : "text-[#fb035c]"}`}>
+              {safeEthChange >= 0 ? "+" : ""}{safeEthChange.toFixed(2)}%
             </span>
           )}
         </div>
-        <div className="flex items-center gap-[4px] bg-[#2b2b2b] rounded-[8px] p-[3px]">
+        <div className={`flex items-center gap-[4px] ${btnBarBg} rounded-[8px] p-[3px]`}>
           {ranges.map((r) => (
             <Button
               key={r.value}
@@ -596,7 +619,7 @@ function PriceChart() {
               refetch();
               toast("Refreshing chart data...");
             }}
-            className="px-[6px] py-[4px] rounded-[6px] text-[#86909c] hover:text-white cursor-pointer transition-colors text-[11px]"
+            className="px-[6px] py-[4px] rounded-[6px] text-[#86909c] hover:text-foreground cursor-pointer transition-colors text-[11px]"
             title="Refresh"
           >
             ↻
@@ -634,12 +657,12 @@ function PriceChart() {
                   <stop offset="100%" stopColor="#fb035c" stopOpacity={0} />
                 </linearGradient>
               </defs>
-              <CartesianGrid strokeDasharray="4 4" stroke="rgba(255,255,255,0.05)" vertical={false} />
+              <CartesianGrid strokeDasharray="4 4" stroke={gridColor} vertical={false} />
               <XAxis
                 dataKey="date"
                 tick={{ fill: "#86909c", fontSize: 11, fontFamily: "Inter, sans-serif" }}
                 tickLine={false}
-                axisLine={{ stroke: "rgba(255,255,255,0.08)" }}
+                axisLine={{ stroke: axisLineColor }}
                 interval="preserveStartEnd"
               />
               <YAxis
@@ -659,7 +682,7 @@ function PriceChart() {
                 fill="url(#btcGradient)"
                 animationDuration={800}
                 dot={false}
-                activeDot={{ r: 4, stroke: "#165DFF", strokeWidth: 2, fill: "#1c1c1c" }}
+                activeDot={{ r: 4, stroke: "#165DFF", strokeWidth: 2, fill: activeDotFill }}
               />
               <Area
                 type="monotone"
@@ -670,7 +693,7 @@ function PriceChart() {
                 fill="url(#ethGradient)"
                 animationDuration={800}
                 dot={false}
-                activeDot={{ r: 4, stroke: "#0FC6C2", strokeWidth: 2, fill: "#1c1c1c" }}
+                activeDot={{ r: 4, stroke: "#0FC6C2", strokeWidth: 2, fill: activeDotFill }}
               />
               <Area
                 type="monotone"
@@ -681,7 +704,7 @@ function PriceChart() {
                 fill="url(#cscsGradient)"
                 animationDuration={800}
                 dot={false}
-                activeDot={{ r: 4, stroke: "#00ffb9", strokeWidth: 2, fill: "#1c1c1c" }}
+                activeDot={{ r: 4, stroke: "#00ffb9", strokeWidth: 2, fill: activeDotFill }}
               />
               <Area
                 type="monotone"
@@ -692,7 +715,7 @@ function PriceChart() {
                 fill="url(#cscrGradient)"
                 animationDuration={800}
                 dot={false}
-                activeDot={{ r: 4, stroke: "#fb035c", strokeWidth: 2, fill: "#1c1c1c" }}
+                activeDot={{ r: 4, stroke: "#fb035c", strokeWidth: 2, fill: activeDotFill }}
               />
             </AreaChart>
           </ResponsiveContainer>
@@ -714,7 +737,7 @@ function PriceChart() {
 
 /* Send / Swap */
 
-function ActionCard({ portfolio }: { portfolio: ReturnType<typeof usePortfolioFromBackend> }) {
+function ActionCard({ portfolio }: { portfolio: PortfolioData }) {
   const [activeTab, setActiveTab] = useState<"send" | "swap">("send");
   const [recipient, setRecipient] = useState("");
   const [sendAmount, setSendAmount] = useState("");
@@ -722,6 +745,9 @@ function ActionCard({ portfolio }: { portfolio: ReturnType<typeof usePortfolioFr
   const [tokenAddress, setTokenAddress] = useState("");
   const [selectedToken, setSelectedToken] = useState<"ETH" | "CSCS" | "CSCR">("ETH");
   const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [isSending, setIsSending] = useState(false);
+  const [isSwapping, setIsSwapping] = useState(false);
+
 
   const tokens = [
     { symbol: "ETH" as const, balance: portfolio.ethHoldings, color: "#0FC6C2", icon: <EthLogo size={12} /> },
@@ -731,7 +757,7 @@ function ActionCard({ portfolio }: { portfolio: ReturnType<typeof usePortfolioFr
 
   const activeToken = tokens.find((t) => t.symbol === selectedToken)!;
 
-  const handleSend = () => {
+  const handleSend = async () => {
     if (!recipient.trim()) {
       toast.error("Please enter a recipient address");
       return;
@@ -740,12 +766,18 @@ function ActionCard({ portfolio }: { portfolio: ReturnType<typeof usePortfolioFr
       toast.error("Please enter a valid amount");
       return;
     }
+
+    setIsSending(true);
+    // Simulate transaction delay for better UX (Wingman requirement)
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
     toast.success(`Sent ${sendAmount} ${selectedToken} to ${recipient.slice(0, 10)}...`);
     setRecipient("");
     setSendAmount("");
+    setIsSending(false);
   };
 
-  const handleSwap = () => {
+  const handleSwap = async () => {
     if (!swapAmount.trim() || isNaN(Number(swapAmount))) {
       toast.error("Please enter a valid ETH amount");
       return;
@@ -754,9 +786,15 @@ function ActionCard({ portfolio }: { portfolio: ReturnType<typeof usePortfolioFr
       toast.error("Please enter a token address");
       return;
     }
+
+    setIsSwapping(true);
+    // Simulate swap delay
+    await new Promise(resolve => setTimeout(resolve, 2500));
+
     toast.success(`Swapping ${swapAmount} ETH via Uniswap V2...`);
     setSwapAmount("");
     setTokenAddress("");
+    setIsSwapping(false);
   };
 
   return (
@@ -806,9 +844,8 @@ function ActionCard({ portfolio }: { portfolio: ReturnType<typeof usePortfolioFr
                   <button
                     key={t.symbol}
                     onClick={() => { setSelectedToken(t.symbol); setDropdownOpen(false); }}
-                    className={`flex items-center gap-[10px] w-full px-[12px] py-[8px] rounded-[8px] cursor-pointer transition-colors ${
-                      selectedToken === t.symbol ? "bg-white/10" : "hover:bg-white/5"
-                    }`}
+                    className={`flex items-center gap-[10px] w-full px-[12px] py-[8px] rounded-[8px] cursor-pointer transition-colors ${selectedToken === t.symbol ? "bg-white/10" : "hover:bg-white/5"
+                      }`}
                   >
                     <div
                       className="flex items-center justify-center rounded-full shrink-0 size-[24px]"
@@ -836,11 +873,10 @@ function ActionCard({ portfolio }: { portfolio: ReturnType<typeof usePortfolioFr
       {/* Content */}
       {activeTab === "send" ? (
         <div className="flex flex-col gap-[12px]">
-          <input
-            className="bg-[#2b2b2b] rounded-[12px] h-[40px] flex items-center px-[16px] font-['Poppins',sans-serif] font-semibold text-[14px] text-white tracking-[0.14px] outline-none placeholder-white/50 w-full"
+          <AddressInput
             placeholder="Recipient address (0x...)"
             value={recipient}
-            onChange={(e) => setRecipient(e.target.value)}
+            onChange={setRecipient}
           />
           <input
             className="bg-[#2b2b2b] rounded-[12px] h-[40px] flex items-center px-[16px] font-['Poppins',sans-serif] font-semibold text-[14px] text-white tracking-[0.14px] outline-none placeholder-white/50 w-full"
@@ -853,6 +889,7 @@ function ActionCard({ portfolio }: { portfolio: ReturnType<typeof usePortfolioFr
               size="md"
               className="w-full"
               onClick={handleSend}
+              loading={isSending}
             >
               ↗ Send {selectedToken}
             </Button>
@@ -878,6 +915,7 @@ function ActionCard({ portfolio }: { portfolio: ReturnType<typeof usePortfolioFr
               size="md"
               className="w-full"
               onClick={handleSwap}
+              loading={isSwapping}
             >
               ⇆ SWAP
             </Button>
@@ -991,9 +1029,9 @@ function useMarketData() {
           id: "ethereum",
           name: "Ethereum",
           icon: <EthereumLogo />,
-          price: ethData?.current_price ?? 2847.23,
-          change: ethData?.price_change_percentage_24h ?? 2.34,
-          sparkline: (ethData?.sparkline_in_7d?.price ?? genSparkline(2847, 60)).map((v: number) => ({ v })),
+          price: ethData?.current_price ?? 0,
+          change: ethData?.price_change_percentage_24h ?? 0,
+          sparkline: (ethData?.sparkline_in_7d?.price ?? genSparkline(0, 60)).map((v: number) => ({ v })),
           barColor: "linear-gradient(to right, #5cff9c, #00ffa3)",
           lineColor: "#00ffa3",
         },
@@ -1047,7 +1085,7 @@ function useMarketData() {
       };
 
       setTokens([
-        { id: "ethereum", name: "Ethereum", icon: <EthereumLogo />, price: 2847.23, change: 2.34, sparkline: genSparkline(2847, 60), barColor: "linear-gradient(to right, #5cff9c, #00ffa3)", lineColor: "#00ffa3" },
+        { id: "ethereum", name: "Ethereum", icon: <EthereumLogo />, price: 0, change: 0, sparkline: genSparkline(0, 60), barColor: "linear-gradient(to right, #5cff9c, #00ffa3)", lineColor: "#00ffa3" },
         { id: "bitcoin", name: "Bitcoin", icon: <BitcoinLogo />, price: 63542.12, change: 3.17, sparkline: genSparkline(63542, 800), barColor: "linear-gradient(248.572deg, rgb(251, 3, 245) 11.694%, rgb(170, 156, 255) 112.48%)", lineColor: "#aa9cff" },
         { id: "cscs", name: "CSCS", icon: <div className="bg-[#5096af] flex items-center justify-center p-[4px] rounded-full shrink-0 size-[32px]"><span className="font-['Inter',sans-serif] font-bold text-[10px] text-white">CS</span></div>, price: 1.02, change: 0.49, sparkline: genSparkline(1.02, 0.02), barColor: "linear-gradient(248.572deg, rgb(80, 175, 149) 11.694%, rgb(0, 255, 185) 112.48%)", lineColor: "#00ffb9", contract: CSCS_CONTRACT },
         { id: "cscr", name: "CSCR", icon: <div className="bg-[#fffdfd] flex items-center justify-center p-[4px] rounded-full shrink-0 size-[32px]"><span className="font-['Inter',sans-serif] font-bold text-[10px] text-[#333]">CR</span></div>, price: 0.572, change: -1.89, sparkline: genSparkline(0.572, 0.015), barColor: "linear-gradient(248.572deg, rgb(251, 3, 92) 11.694%, rgb(250, 159, 165) 112.48%)", lineColor: "#fb035c", contract: CSCR_CONTRACT },
@@ -1188,12 +1226,10 @@ function ProfileMiniCard() {
 }
 
 function WalletAddress() {
-  const [copied, setCopied] = useState(false);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [selectedToken, setSelectedToken] = useState<"ETH" | "CSCS" | "CSCR">("ETH");
   const { address, loading } = useWagmiSession();
-  const portfolio = usePortfolioFromBackend(address);
-  const truncated = address ? `${address.slice(0, 6)}...${address.slice(-4)}` : "—";
+  const portfolio = usePortfolio();
 
   const walletTokens = [
     { symbol: "ETH" as const, balance: portfolio.ethHoldings, color: "#0FC6C2", icon: <EthLogo size={12} /> },
@@ -1202,13 +1238,7 @@ function WalletAddress() {
   ];
   const activeWalletToken = walletTokens.find((t) => t.symbol === selectedToken)!;
 
-  const handleCopy = () => {
-    if (!address) return;
-    navigator.clipboard.writeText(address);
-    setCopied(true);
-    toast.success("Address copied to clipboard!");
-    setTimeout(() => setCopied(false), 2000);
-  };
+
 
   return (
     <div className="backdrop-blur-[10px] bg-[#2c2c2c]/60 rounded-[16px] p-[20px]">
@@ -1279,25 +1309,9 @@ function WalletAddress() {
         </a>
       ) : (
         <>
-          <button
-            onClick={handleCopy}
-            className="bg-[#2b2b2b] rounded-[12px] h-[32px] flex items-center justify-center px-[10px] w-full cursor-pointer hover:bg-[#363636] transition-colors group"
-            title={address}
-          >
-            <p className="font-['Poppins',sans-serif] font-semibold text-[14px] text-white tracking-[0.14px] truncate">{truncated}</p>
-            <span className="ml-[8px] text-white/50 shrink-0">
-              {copied ? (
-                <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                  <path d="M20 6L9 17l-5-5" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              ) : (
-                <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-                  <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
-                </svg>
-              )}
-            </span>
-          </button>
+          <div className="bg-[#2b2b2b] rounded-[12px] min-h-[32px] flex items-center justify-center px-[10px] w-full transition-colors group">
+            <Address address={address} />
+          </div>
           <a
             href={`https://etherscan.io/address/${address}`}
             target="_blank"
@@ -1353,11 +1367,93 @@ function JoinCommunity() {
   );
 }
 
+/* User Assets Table */
+
+function UserAssetsTable({ assets, loading, ethHoldings, ethPrice }: { assets: any[]; loading: boolean; ethHoldings: number; ethPrice: number }) {
+  if (loading) {
+    return (
+      <div className="backdrop-blur-[10px] bg-[#1c1c1c]/60 rounded-[16px] p-[20px] animate-pulse">
+        <div className="h-[20px] bg-white/10 w-[150px] mb-[15px] rounded" />
+        <div className="space-y-[10px]">
+          {[1, 2, 3].map(i => <div key={i} className="h-[40px] bg-white/5 rounded" />)}
+        </div>
+      </div>
+    );
+  }
+
+  // Combine ETH with other assets for a full list
+  const allAssets = [
+    { symbol: 'ETH', name: 'Ethereum', balance: ethHoldings.toString(), contractAddress: 'native', logo: null, price: ethPrice },
+    ...assets
+  ];
+
+  return (
+    <div className="backdrop-blur-[10px] bg-[#1c1c1c]/60 rounded-[16px] p-[16px] sm:p-[20px]">
+      <p className="font-['Inter',sans-serif] font-medium text-[18px] text-white mb-[16px]">YOUR ASSETS</p>
+      <div className="overflow-x-auto">
+        <table className="w-full text-left border-collapse">
+          <thead>
+            <tr className="border-b border-white/10">
+              <th className="py-[10px] font-['Inter',sans-serif] text-[12px] text-[#86909c] font-medium">ASSET</th>
+              <th className="py-[10px] font-['Inter',sans-serif] text-[12px] text-[#86909c] font-medium text-right">BALANCE</th>
+              <th className="py-[10px] font-['Inter',sans-serif] text-[12px] text-[#86909c] font-medium text-right hidden sm:table-cell">CONTRACT</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-white/5">
+            {allAssets.map((asset, i) => {
+              const addr = asset.contractAddress;
+              const displayAddr = addr === 'native' ? 'Native' : `${addr.slice(0, 6)}...${addr.slice(-4)}`;
+              const balance = parseFloat(asset.balance || '0');
+              if (balance === 0 && asset.symbol !== 'CSCS' && asset.symbol !== 'CSCR' && asset.symbol !== 'ETH') return null;
+
+              return (
+                <tr key={i} className="hover:bg-white/5 transition-colors group">
+                  <td className="py-[12px]">
+                    <div className="flex items-center gap-[10px]">
+                      <div className="size-[32px] rounded-full bg-white/10 flex items-center justify-center overflow-hidden shrink-0">
+                         {asset.logo ? <img src={asset.logo} alt={asset.symbol} className="size-full object-contain" /> : <span className="text-[10px] font-bold">{(asset.symbol || '??').slice(0, 2)}</span>}
+                      </div>
+                      <div className="min-w-0">
+                        <p className="font-['Inter',sans-serif] font-semibold text-[14px] text-white truncate">{asset.name}</p>
+                        <p className="font-['Inter',sans-serif] text-[12px] text-[#86909c]">{asset.symbol}</p>
+                      </div>
+                    </div>
+                  </td>
+                  <td className="py-[12px] text-right">
+                    <p className="font-['Inter',sans-serif] font-semibold text-[14px] text-white">
+                      {balance.toLocaleString(undefined, { maximumFractionDigits: 6 })}
+                    </p>
+                  </td>
+                  <td className="py-[12px] text-right hidden sm:table-cell">
+                    {addr !== 'native' ? (
+                      <a 
+                        href={`https://etherscan.io/address/${addr}`} 
+                        target="_blank" 
+                        rel="noopener noreferrer"
+                        className="font-['Inter',sans-serif] text-[12px] text-[#0FC6C2] hover:underline"
+                        title={addr}
+                      >
+                        {displayAddr}
+                      </a>
+                    ) : (
+                      <span className="font-['Inter',sans-serif] text-[12px] text-[#86909c]">Native</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 /* Dashboard Page */
 
 export function DashboardPage() {
   const { address } = useWagmiSession();
-  const portfolioData = usePortfolioFromBackend(address);
+  const portfolioData = usePortfolio();
   const { isDark } = useTheme();
   const tc = themeColors(isDark);
 
@@ -1392,6 +1488,7 @@ export function DashboardPage() {
           )}
           <PriceChart />
         </div>
+        <UserAssetsTable assets={portfolioData.assets} loading={portfolioData.loading} ethHoldings={portfolioData.ethHoldings} ethPrice={portfolioData.ethPrice} />
         <ActionCard portfolio={portfolioData} />
       </div>
 
