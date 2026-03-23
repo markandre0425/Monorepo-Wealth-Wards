@@ -48,6 +48,7 @@ if (globalThis._WAGMI_INIT) {
 
       const { createAppKit } = await import('@reown/appkit')
       const { WagmiAdapter } = await import('@reown/appkit-adapter-wagmi')
+      const { siweConfig } = await import('./siwe-config.ts')
 
       const projectId = import.meta.env.VITE_REOWN_PROJECT_ID
       if (!projectId) {
@@ -76,6 +77,7 @@ if (globalThis._WAGMI_INIT) {
         projectId,
         networks: [mainnet, sepolia],
         features: { analytics: false },
+        siweConfig,
       })
 
       globalThis._appKitModal = appKitModal

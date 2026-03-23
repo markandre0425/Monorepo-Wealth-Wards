@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url'
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
-const isDev = process.env.NODE_ENV === 'development'
+const isDev = !app.isPackaged || process.env.NODE_ENV === 'development'
+const ELECTRON_URL = process.env.ELECTRON_URL || 'http://localhost:3000/'
 
 // ── Chromium flags (MUST come before app.whenReady()) ────────────────
 //
@@ -58,12 +59,13 @@ function createWindow() {
   })
 
   if (isDev) {
-    win.loadURL('http://localhost:3000/')
+    win.loadURL(ELECTRON_URL)
     // DevTools: uncomment the next line when you need the inspector.
     win.webContents.openDevTools()
   } else {
-    // In production, load the landing page from the dist folder
-    win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
+    // In production, load the dashboard page from the workspace dist folder
+    // Relative to apps/server/electron/main.js, the path is ../../dashboard/dist/index.html
+    win.loadFile(path.join(__dirname, '..', '..', 'dashboard', 'dist', 'index.html'))
   }
 }
 

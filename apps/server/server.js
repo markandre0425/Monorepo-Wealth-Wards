@@ -237,6 +237,11 @@ const nonceMemory = new Map()
 
 const getNonceKey = (address, nonce) => `nonce:${address.toLowerCase()}:${nonce}`
 
+// Address-independent nonce pool for AppKit SIWE flow
+// (AppKit calls getNonce BEFORE the user connects, so address is unknown at that stage)
+const pendingNonceMemory = new Map()
+const PENDING_NONCE_KEY = (nonce) => `pending-nonce:${nonce}`
+
 // SIWE EIP-4361 requires nonce to be 8*( ALPHA / DIGIT ) — alphanumeric only (no hyphens)
 function generateSiweNonce() {
   return randomBytes(16).toString('hex')
@@ -320,7 +325,7 @@ function extractNonceFromMessage(message) {
   return match?.[1]?.trim() ?? null
 }
 
-// API: Get Nonce
+// API: Get Nonce (requires address)
 app.get('/api/nonce', authLimiter, async (req, res) => {
   const address = String(req.query.address ?? '')
   if (!isAddress(address)) return res.status(400).json({ error: 'Invalid address' })
@@ -330,6 +335,31 @@ app.get('/api/nonce', authLimiter, async (req, res) => {
     res.json({ address, nonce, expiresAt })
   } catch (err) {
     console.error('Redis error:', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// API: Address-independent nonce for Reown AppKit SIWE flow
+// AppKit calls getNonce() BEFORE the wallet is connected, so an address-free endpoint is required.
+app.get('/api/siwe/nonce', authLimiter, async (req, res) => {
+  try {
+    const nonce = generateSiweNonce()
+    const expiresAt = Date.now() + NONCE_TTL_SECONDS * 1000
+    const key = PENDING_NONCE_KEY(nonce)
+
+    if (redis) {
+      try {
+        await redis.set(key, nonce, 'EX', NONCE_TTL_SECONDS)
+      } catch {
+        pendingNonceMemory.set(key, { nonce, expiresAt })
+      }
+    } else {
+      pendingNonceMemory.set(key, { nonce, expiresAt })
+    }
+
+    res.json({ nonce, expiresAt })
+  } catch (err) {
+    console.error('SIWE nonce error:', err)
     return res.status(500).json({ error: 'Internal server error' })
   }
 })
@@ -476,8 +506,27 @@ app.post('/api/siwe/verify', strictAuthLimiter, async (req, res) => {
   // Trade-off: a bad signature burns the nonce, forcing the user to request a
   // new SIWE message. This is intentional — it prevents an attacker from
   // replaying a valid nonce with forged signatures in a retry loop.
+  // Check both address-keyed nonces (from /api/nonce) AND pending nonces (from /api/siwe/nonce used by Reown AppKit)
   const nonceValid = await takeNonce(siwe.address, siwe.nonce)
-  if (!nonceValid) return res.status(400).json({ ok: false, error: 'Missing/expired nonce. Please request a new sign-in message.' })
+  let pendingNonceValid = false
+  if (!nonceValid) {
+    const pendingKey = PENDING_NONCE_KEY(siwe.nonce)
+    if (redis) {
+      try {
+        const stored = await redis.getdel(pendingKey)
+        pendingNonceValid = stored === siwe.nonce
+      } catch {
+        const entry = pendingNonceMemory.get(pendingKey)
+        pendingNonceMemory.delete(pendingKey)
+        pendingNonceValid = !!(entry && Date.now() <= entry.expiresAt && entry.nonce === siwe.nonce)
+      }
+    } else {
+      const entry = pendingNonceMemory.get(pendingKey)
+      pendingNonceMemory.delete(pendingKey)
+      pendingNonceValid = !!(entry && Date.now() <= entry.expiresAt && entry.nonce === siwe.nonce)
+    }
+  }
+  if (!nonceValid && !pendingNonceValid) return res.status(400).json({ ok: false, error: 'Missing/expired nonce. Please request a new sign-in message.' })
 
   let verifyResult
   try {

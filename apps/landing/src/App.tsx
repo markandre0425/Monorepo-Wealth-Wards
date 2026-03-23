@@ -120,21 +120,25 @@ function App() {
       ease: 'outExpo',
     })
 
-    animate('.description', {
-      opacity: 1,
-      translateY: 0,
-      duration: 1000,
-      delay: 1600,
-      ease: 'outExpo',
-    })
+    if (document.querySelector('.description')) {
+      animate('.description', {
+        opacity: 1,
+        translateY: 0,
+        duration: 1000,
+        delay: 1600,
+        ease: 'outExpo',
+      })
+    }
 
-    animate('.notify-form', {
-      opacity: 1,
-      translateY: 0,
-      duration: 1000,
-      delay: 1800,
-      ease: 'outExpo',
-    })
+    if (document.querySelector('.notify-form')) {
+      animate('.notify-form', {
+        opacity: 1,
+        translateY: 0,
+        duration: 1000,
+        delay: 1800,
+        ease: 'outExpo',
+      })
+    }
 
     if (particlesRef.current) {
       particlesRef.current.innerHTML = ''

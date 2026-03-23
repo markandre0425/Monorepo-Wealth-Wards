@@ -31,7 +31,7 @@ const figmaAssetPlugin = {
 // When embedded in landing: BASE_URL=/dashboard/ (web) or BASE_URL=./ (Electron).
 // In dev (serve): use /dashboard/ so app is at http://localhost:3001/dashboard/
 export default defineConfig(({ command }) => ({
-  base: process.env.BASE_URL ?? (command === 'serve' ? '/dashboard/' : '/'),
+  base: process.env.BASE_URL ?? (command === 'serve' ? '/dashboard/' : './'),
   envDir: '../../',
   plugins: [
     figmaAssetPlugin,
