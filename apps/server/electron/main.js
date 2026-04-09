@@ -61,7 +61,7 @@ function createWindow() {
   if (isDev) {
     win.loadURL(ELECTRON_URL)
     // DevTools: uncomment the next line when you need the inspector.
-    win.webContents.openDevTools()
+    // win.webContents.openDevTools()
   } else {
     // In production, load the dashboard page from the workspace dist folder
     // Relative to apps/server/electron/main.js, the path is ../../dashboard/dist/index.html

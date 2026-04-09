@@ -85,9 +85,17 @@ try {
 
 const TRANSACTION_TYPES = Object.freeze(['Send', 'Swap', 'Receive', 'Buy'])
 const ACTIVITY_TYPES = ['login', 'disconnect']
+const ALERT_RULE_TYPES = Object.freeze(['PRICE_CHANGE_PERCENT', 'WALLET_BALANCE_BELOW', 'LARGE_TX_VALUE'])
+const ALERT_OPERATORS = Object.freeze(['GT', 'LT'])
+const NOTIFICATION_TYPES = Object.freeze(['ALERT_TRIGGERED', 'SYSTEM'])
+const NOTIFICATION_SEVERITIES = Object.freeze(['INFO', 'WARNING', 'CRITICAL'])
+const NOTIFICATION_STATUSES = Object.freeze(['UNREAD', 'READ', 'ARCHIVED'])
 
 let ActivityLog = null
 let TransactionLog = null
+let AlertRule = null
+let Notification = null
+let AlertEvent = null
 let mongoReady = false
 if (process.env.MONGO_URI) {
   mongoose.connection.on('connected', () => {
@@ -140,6 +148,49 @@ if (process.env.MONGO_URI) {
   TransactionLogSchema.index({ address: 1, timestamp: -1 })
   TransactionLogSchema.index({ type: 1 })
   TransactionLog = mongoose.models.TransactionLog || mongoose.model('TransactionLog', TransactionLogSchema)
+
+  const AlertRuleSchema = new mongoose.Schema({
+    userId: { type: String, required: true, index: true },
+    walletAddress: { type: String, required: true, index: true, lowercase: true },
+    isEnabled: { type: Boolean, default: true },
+    ruleType: { type: String, required: true, enum: [...ALERT_RULE_TYPES] },
+    target: {
+      assetId: { type: String, required: true },
+      chainId: { type: Number, default: 1 },
+    },
+    condition: {
+      operator: { type: String, required: true, enum: [...ALERT_OPERATORS] },
+      threshold: { type: Number, required: true },
+      windowMinutes: { type: Number, default: null },
+    },
+    cooldownMinutes: { type: Number, default: 60 },
+    lastTriggeredAt: { type: Date, default: null },
+  }, { timestamps: true })
+  AlertRuleSchema.index({ userId: 1, walletAddress: 1, isEnabled: 1 })
+  AlertRule = mongoose.models.AlertRule || mongoose.model('AlertRule', AlertRuleSchema)
+
+  const NotificationSchema = new mongoose.Schema({
+    userId: { type: String, required: true, index: true },
+    walletAddress: { type: String, required: true, index: true, lowercase: true },
+    alertRuleId: { type: mongoose.Schema.Types.ObjectId, ref: 'AlertRule', default: null, index: true },
+    type: { type: String, required: true, enum: [...NOTIFICATION_TYPES], default: 'ALERT_TRIGGERED' },
+    severity: { type: String, required: true, enum: [...NOTIFICATION_SEVERITIES], default: 'INFO' },
+    title: { type: String, required: true, maxlength: 160 },
+    message: { type: String, required: true, maxlength: 1000 },
+    metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
+    status: { type: String, required: true, enum: [...NOTIFICATION_STATUSES], default: 'UNREAD', index: true },
+    readAt: { type: Date, default: null },
+  }, { timestamps: { createdAt: true, updatedAt: false } })
+  NotificationSchema.index({ userId: 1, status: 1, createdAt: -1 })
+  Notification = mongoose.models.Notification || mongoose.model('Notification', NotificationSchema)
+
+  const AlertEventSchema = new mongoose.Schema({
+    alertRuleId: { type: mongoose.Schema.Types.ObjectId, ref: 'AlertRule', required: true, index: true },
+    dedupeKey: { type: String, required: true, unique: true, index: true },
+    evaluatedAt: { type: Date, default: Date.now, index: true },
+    payload: { type: mongoose.Schema.Types.Mixed, default: {} },
+  }, { timestamps: true })
+  AlertEvent = mongoose.models.AlertEvent || mongoose.model('AlertEvent', AlertEventSchema)
 } else {
   console.log('MONGO_URI not set; activity logs will use file fallback.')
 }
@@ -229,6 +280,9 @@ app.use(cors({
 app.use(express.json({ limit: '10mb' }))
 app.use(cookieParser())
 
+app.get('/api/health', (_req, res) => {
+  return res.json({ ok: true, status: 'healthy', service: 'wagmi-backend' })
+})
 
 // UPDATED NONCE LOGIC (Redis if available, else in-memory)
 
@@ -316,8 +370,90 @@ const SIWE_CLOCK_SKEW_MS = 2 * 60 * 1000
 const ALLOWED_CHAIN_IDS = new Set([mainnet.id, sepolia.id])
 
 // Rate limits
-const authLimiter = rateLimit({ windowMs: 5 * 60 * 1000, limit: 50, standardHeaders: true, legacyHeaders: false })
-const strictAuthLimiter = rateLimit({ windowMs: 5 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false })
+const GLOBAL_RATE_LIMIT_WINDOW_MS = Number(process.env.GLOBAL_RATE_LIMIT_WINDOW_MS || 60 * 1000)
+const GLOBAL_RATE_LIMIT_MAX = Number(process.env.GLOBAL_RATE_LIMIT_MAX || 300)
+const MUTATION_RATE_LIMIT_WINDOW_MS = Number(process.env.MUTATION_RATE_LIMIT_WINDOW_MS || 60 * 1000)
+const MUTATION_RATE_LIMIT_MAX = Number(process.env.MUTATION_RATE_LIMIT_MAX || 120)
+const INTERNAL_RATE_LIMIT_WINDOW_MS = Number(process.env.INTERNAL_RATE_LIMIT_WINDOW_MS || 5 * 60 * 1000)
+const INTERNAL_RATE_LIMIT_MAX = Number(process.env.INTERNAL_RATE_LIMIT_MAX || 120)
+
+const limiterKey = (req) => getClientIp(req)
+
+function limiterUserKey(req) {
+  const cookieToken = req.cookies?.token
+  if (!cookieToken) return 'anon'
+  try {
+    const payload = jwt.verify(cookieToken, JWT_SECRET)
+    return String(payload?.sub || payload?.address || 'anon').toLowerCase()
+  } catch {
+    return 'anon'
+  }
+}
+
+function hybridLimiterKey(req, scope = 'hybrid') {
+  return `${limiterKey(req)}:${limiterUserKey(req)}:${scope}`
+}
+
+const globalApiLimiter = rateLimit({
+  windowMs: GLOBAL_RATE_LIMIT_WINDOW_MS,
+  limit: GLOBAL_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => hybridLimiterKey(req, 'global'),
+  message: { ok: false, error: 'Too many requests' },
+})
+
+const mutationApiLimiter = rateLimit({
+  windowMs: MUTATION_RATE_LIMIT_WINDOW_MS,
+  limit: MUTATION_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `${hybridLimiterKey(req, 'mutation')}:${req.method}`,
+  message: { ok: false, error: 'Too many write requests' },
+})
+
+const internalLimiter = rateLimit({
+  windowMs: INTERNAL_RATE_LIMIT_WINDOW_MS,
+  limit: INTERNAL_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => hybridLimiterKey(req, 'internal'),
+  message: { ok: false, error: 'Too many internal requests' },
+})
+
+const expensiveReadLimiter = rateLimit({
+  windowMs: Number(process.env.EXPENSIVE_READ_LIMIT_WINDOW_MS || 60 * 1000),
+  limit: Number(process.env.EXPENSIVE_READ_LIMIT_MAX || 40),
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => hybridLimiterKey(req, 'expensive'),
+  message: { ok: false, error: 'Too many expensive read requests' },
+})
+
+const authLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  limit: 50,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => hybridLimiterKey(req, 'auth'),
+})
+
+const strictAuthLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => hybridLimiterKey(req, 'strict-auth'),
+})
+
+app.use('/api', globalApiLimiter)
+app.use('/api', (req, res, next) => {
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+    return mutationApiLimiter(req, res, next)
+  }
+  return next()
+})
+app.use('/internal', internalLimiter)
 
 // Helper: Extract Nonce from Message
 function extractNonceFromMessage(message) {
@@ -1067,7 +1203,7 @@ function getMoralisChain(chainId) {
 
 // ------------------------------------------------------------------
 
-app.get('/api/assets', requireAuth, async (req, res) => {
+app.get('/api/assets', expensiveReadLimiter, requireAuth, async (req, res) => {
   const authAddress = req.user?.address ?? null;
   if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' });
 
@@ -1109,7 +1245,7 @@ app.get('/api/tokens', requireAuth, async (req, res) => {
 });
 
 // NEW DEEP DISCOVERY ENDPOINT
-app.get('/api/all-assets', requireAuth, async (req, res) => {
+app.get('/api/all-assets', expensiveReadLimiter, requireAuth, async (req, res) => {
   const authAddress = req.user?.address ?? null;
   if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' });
 
@@ -1248,7 +1384,7 @@ async function setCachedData(key, value, ttlSeconds = 300) {
 }
 
 // GET /api/token-price?address=0x...&chainId=1
-app.get('/api/token-price', async (req, res) => {
+app.get('/api/token-price', expensiveReadLimiter, requireAuth, async (req, res) => {
   const address = (req.query.address || '').trim().toLowerCase()
   if (!address) return res.status(400).json({ ok: false, error: 'Address required' })
   
@@ -1304,7 +1440,7 @@ app.get('/api/token-price', async (req, res) => {
 })
 
 // GET /api/token-prices?addresses=0x1,0x2&chainId=1
-app.get('/api/token-prices', async (req, res) => {
+app.get('/api/token-prices', expensiveReadLimiter, requireAuth, async (req, res) => {
   const raw = req.query.addresses
   const addresses = Array.isArray(raw) ? raw : (typeof raw === 'string' ? raw.split(',') : [])
   const cleanAddresses = addresses.map(a => (a || '').trim().toLowerCase()).filter(a => a)
@@ -1571,7 +1707,508 @@ app.get('/api/user/profile', requireAuth, async (req, res) => {
 
 // ------------------------------------------------------------------
 
+// ALERT RULES + NOTIFICATIONS (MVP)
+// ------------------------------------------------------------------
+function getAuthContext(req) {
+  const userId = req.user?.sub ?? req.user?.address ?? null
+  const walletAddress = req.user?.address ?? null
+  return { userId, walletAddress }
+}
 
+function assertAlertsReady(res) {
+  if (!mongoReady || !AlertRule || !Notification || !AlertEvent) {
+    res.status(503).json({ ok: false, error: 'Alerts require MongoDB (MONGO_URI)' })
+    return false
+  }
+  return true
+}
+
+function parseAlertRuleInput(body = {}) {
+  const { ruleType, target, condition, cooldownMinutes, isEnabled } = body
+  if (!ALERT_RULE_TYPES.includes(ruleType)) return { error: 'Invalid ruleType' }
+  if (!target || typeof target.assetId !== 'string' || !target.assetId.trim()) return { error: 'Invalid target.assetId' }
+  if (!condition || !ALERT_OPERATORS.includes(condition.operator)) return { error: 'Invalid condition.operator' }
+  if (!Number.isFinite(Number(condition.threshold))) return { error: 'Invalid condition.threshold' }
+  const windowMinutes = condition.windowMinutes != null ? Number(condition.windowMinutes) : null
+  if (windowMinutes != null && (!Number.isFinite(windowMinutes) || windowMinutes <= 0)) return { error: 'Invalid condition.windowMinutes' }
+  const cooldown = cooldownMinutes != null ? Number(cooldownMinutes) : 60
+  if (!Number.isFinite(cooldown) || cooldown <= 0) return { error: 'Invalid cooldownMinutes' }
+  return {
+    value: {
+      ruleType,
+      target: {
+        assetId: target.assetId.trim(),
+        chainId: target.chainId != null ? Number(target.chainId) : 1,
+      },
+      condition: {
+        operator: condition.operator,
+        threshold: Number(condition.threshold),
+        windowMinutes,
+      },
+      cooldownMinutes: cooldown,
+      ...(isEnabled != null ? { isEnabled: Boolean(isEnabled) } : {}),
+    }
+  }
+}
+
+function mapRule(doc) {
+  if (!doc) return null
+  return {
+    id: String(doc._id),
+    isEnabled: doc.isEnabled,
+    ruleType: doc.ruleType,
+    target: doc.target,
+    condition: doc.condition,
+    cooldownMinutes: doc.cooldownMinutes,
+    lastTriggeredAt: doc.lastTriggeredAt,
+    createdAt: doc.createdAt,
+    updatedAt: doc.updatedAt,
+  }
+}
+
+function mapNotification(doc) {
+  if (!doc) return null
+  return {
+    id: String(doc._id),
+    type: doc.type,
+    severity: doc.severity,
+    title: doc.title,
+    message: doc.message,
+    status: doc.status,
+    alertRuleId: doc.alertRuleId ? String(doc.alertRuleId) : null,
+    metadata: doc.metadata ?? {},
+    createdAt: doc.createdAt,
+    readAt: doc.readAt ?? null,
+  }
+}
+
+function encodeCursor(doc) {
+  const payload = { createdAt: doc.createdAt?.toISOString?.() ?? new Date().toISOString(), id: String(doc._id) }
+  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
+}
+
+function decodeCursor(cursor) {
+  try {
+    const raw = Buffer.from(String(cursor), 'base64url').toString('utf8')
+    const parsed = JSON.parse(raw)
+    if (!parsed?.createdAt || !parsed?.id) return null
+    const dt = new Date(parsed.createdAt)
+    if (Number.isNaN(dt.getTime())) return null
+    if (!mongoose.Types.ObjectId.isValid(parsed.id)) return null
+    return { createdAt: dt, id: parsed.id }
+  } catch {
+    return null
+  }
+}
+
+const alertsWorkerState = {
+  lastRunAt: null,
+  lastDurationMs: null,
+  lastSummary: null,
+}
+
+function compareNumeric(operator, value, threshold) {
+  if (operator === 'GT') return value > threshold
+  if (operator === 'LT') return value < threshold
+  return false
+}
+
+async function fetchCoinPriceUsd(assetId) {
+  const id = String(assetId || '').trim().toLowerCase()
+  if (!id) return null
+  const allowedIds = new Set(['ethereum', 'bitcoin'])
+  if (!allowedIds.has(id)) return null
+  const resp = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}&vs_currencies=usd`)
+  if (!resp.ok) return null
+  const json = await resp.json()
+  const price = json?.[id]?.usd
+  return Number.isFinite(Number(price)) ? Number(price) : null
+}
+
+async function evaluateRuleSignal(rule) {
+  const threshold = Number(rule.condition?.threshold)
+  const operator = rule.condition?.operator
+  if (!Number.isFinite(threshold) || !ALERT_OPERATORS.includes(operator)) {
+    return { triggered: false, skipped: 'invalid-condition' }
+  }
+
+  if (rule.ruleType === 'WALLET_BALANCE_BELOW') {
+    try {
+      const chainId = Number(rule.target?.chainId || 1)
+      const client = getPublicClient(chainId)
+      const balanceWei = await client.getBalance({ address: getAddress(rule.walletAddress) })
+      const balanceEth = Number(formatEther(balanceWei))
+      const triggered = compareNumeric(operator, balanceEth, threshold)
+      return {
+        triggered,
+        severity: triggered ? 'WARNING' : 'INFO',
+        title: `Wallet balance ${operator === 'LT' ? 'below' : 'above'} threshold`,
+        message: `Wallet balance is ${balanceEth.toFixed(6)} ETH (threshold ${operator} ${threshold}).`,
+        metadata: { chainId, assetId: rule.target?.assetId, balanceEth, threshold, operator },
+      }
+    } catch {
+      return { triggered: false, skipped: 'balance-fetch-failed' }
+    }
+  }
+
+  if (rule.ruleType === 'LARGE_TX_VALUE') {
+    const lookbackMinutes = Number(rule.condition?.windowMinutes) > 0 ? Number(rule.condition.windowMinutes) : 60
+    const since = new Date(Date.now() - lookbackMinutes * 60 * 1000)
+    try {
+      const latest = await TransactionLog.findOne({
+        address: rule.walletAddress.toLowerCase(),
+        timestamp: { $gte: since },
+        amountEth: { $ne: null },
+      }).sort({ timestamp: -1 }).lean()
+      if (!latest) return { triggered: false, skipped: 'no-recent-tx' }
+      const amountEth = Number(latest.amountEth)
+      if (!Number.isFinite(amountEth)) return { triggered: false, skipped: 'invalid-tx-amount' }
+      const triggered = compareNumeric(operator, amountEth, threshold)
+      return {
+        triggered,
+        severity: triggered ? 'CRITICAL' : 'INFO',
+        title: `Large transaction ${operator === 'GT' ? 'above' : 'below'} threshold`,
+        message: `Recent ${latest.type || 'transaction'} amount ${amountEth} ETH (threshold ${operator} ${threshold}).`,
+        metadata: {
+          txHash: latest.txHash || null,
+          type: latest.type || null,
+          amountEth,
+          threshold,
+          operator,
+          chainId: latest.chainId || rule.target?.chainId || 1,
+        },
+      }
+    } catch {
+      return { triggered: false, skipped: 'tx-lookup-failed' }
+    }
+  }
+
+  if (rule.ruleType === 'PRICE_CHANGE_PERCENT') {
+    const windowMinutes = Number(rule.condition?.windowMinutes) > 0 ? Number(rule.condition.windowMinutes) : 60
+    const priceNow = await fetchCoinPriceUsd(rule.target?.assetId)
+    if (!Number.isFinite(priceNow)) return { triggered: false, skipped: 'price-unavailable' }
+
+    const windowMs = windowMinutes * 60 * 1000
+    const now = Date.now()
+    const snapshotBucket = Math.floor(now / windowMs)
+    const snapshotKey = `snapshot:${rule._id}:${snapshotBucket}`
+    await AlertEvent.updateOne(
+      { dedupeKey: snapshotKey },
+      {
+        $setOnInsert: {
+          alertRuleId: rule._id,
+          dedupeKey: snapshotKey,
+          evaluatedAt: new Date(),
+          payload: { kind: 'PRICE_SNAPSHOT', assetId: rule.target?.assetId, priceUsd: priceNow },
+        }
+      },
+      { upsert: true }
+    )
+
+    const olderThan = new Date(now - windowMs)
+    const baselineEvent = await AlertEvent.findOne({
+      alertRuleId: rule._id,
+      'payload.kind': 'PRICE_SNAPSHOT',
+      evaluatedAt: { $lte: olderThan },
+    }).sort({ evaluatedAt: -1 }).lean()
+
+    if (!baselineEvent?.payload?.priceUsd) return { triggered: false, skipped: 'no-baseline-yet' }
+    const baseline = Number(baselineEvent.payload.priceUsd)
+    if (!Number.isFinite(baseline) || baseline <= 0) return { triggered: false, skipped: 'invalid-baseline' }
+
+    const changePercent = ((priceNow - baseline) / baseline) * 100
+    const triggered = compareNumeric(operator, changePercent, threshold)
+    return {
+      triggered,
+      severity: triggered ? 'WARNING' : 'INFO',
+      title: `${String(rule.target?.assetId || 'Asset').toUpperCase()} price change alert`,
+      message: `${rule.target?.assetId} changed ${changePercent.toFixed(2)}% over ${windowMinutes}m (threshold ${operator} ${threshold}%).`,
+      metadata: { assetId: rule.target?.assetId, priceNow, baselinePrice: baseline, changePercent, threshold, operator, windowMinutes },
+    }
+  }
+
+  return { triggered: false, skipped: 'unsupported-rule-type' }
+}
+
+app.get('/api/alerts/rules', requireAuth, async (req, res) => {
+  if (!assertAlertsReady(res)) return
+  const { userId, walletAddress } = getAuthContext(req)
+  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
+  try {
+    const rules = await AlertRule.find({ userId, walletAddress: walletAddress.toLowerCase() }).sort({ createdAt: -1 }).lean()
+    return res.json({ ok: true, rules: rules.map(mapRule) })
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: 'Failed to list alert rules' })
+  }
+})
+
+app.post('/api/alerts/rules', requireAuth, async (req, res) => {
+  if (!assertAlertsReady(res)) return
+  const { userId, walletAddress } = getAuthContext(req)
+  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
+  const validation = parseAlertRuleInput(req.body)
+  if (validation.error) return res.status(400).json({ ok: false, error: validation.error })
+  try {
+    const activeCount = await AlertRule.countDocuments({ userId, walletAddress: walletAddress.toLowerCase(), isEnabled: true })
+    if (activeCount >= 20) return res.status(429).json({ ok: false, error: 'Active alert rule limit reached (20)' })
+    const doc = await AlertRule.create({ userId, walletAddress: walletAddress.toLowerCase(), isEnabled: true, ...validation.value })
+    return res.status(201).json({ ok: true, rule: mapRule(doc.toObject()) })
+  } catch {
+    return res.status(500).json({ ok: false, error: 'Failed to create alert rule' })
+  }
+})
+
+app.patch('/api/alerts/rules/:id', requireAuth, async (req, res) => {
+  if (!assertAlertsReady(res)) return
+  const { userId, walletAddress } = getAuthContext(req)
+  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
+  if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ ok: false, error: 'Rule not found' })
+
+  const updates = {}
+  if (req.body.ruleType || req.body.target || req.body.condition || req.body.cooldownMinutes != null || req.body.isEnabled != null) {
+    const merged = {
+      ruleType: req.body.ruleType,
+      target: req.body.target,
+      condition: req.body.condition,
+      cooldownMinutes: req.body.cooldownMinutes,
+      isEnabled: req.body.isEnabled,
+    }
+    const hasCore = merged.ruleType || merged.target || merged.condition
+    if (hasCore) {
+      const validation = parseAlertRuleInput({
+        ruleType: merged.ruleType,
+        target: merged.target,
+        condition: merged.condition,
+        cooldownMinutes: merged.cooldownMinutes,
+        isEnabled: merged.isEnabled,
+      })
+      if (validation.error) return res.status(400).json({ ok: false, error: validation.error })
+      Object.assign(updates, validation.value)
+    } else {
+      if (merged.cooldownMinutes != null) {
+        const cooldown = Number(merged.cooldownMinutes)
+        if (!Number.isFinite(cooldown) || cooldown <= 0) return res.status(400).json({ ok: false, error: 'Invalid cooldownMinutes' })
+        updates.cooldownMinutes = cooldown
+      }
+      if (merged.isEnabled != null) updates.isEnabled = Boolean(merged.isEnabled)
+    }
+  }
+
+  try {
+    const doc = await AlertRule.findOneAndUpdate(
+      { _id: req.params.id, userId, walletAddress: walletAddress.toLowerCase() },
+      { $set: updates },
+      { new: true }
+    ).lean()
+    if (!doc) return res.status(404).json({ ok: false, error: 'Rule not found' })
+    return res.json({ ok: true, rule: mapRule(doc) })
+  } catch {
+    return res.status(500).json({ ok: false, error: 'Failed to update alert rule' })
+  }
+})
+
+app.post('/api/alerts/rules/:id/toggle', requireAuth, async (req, res) => {
+  if (!assertAlertsReady(res)) return
+  const { userId, walletAddress } = getAuthContext(req)
+  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
+  if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ ok: false, error: 'Rule not found' })
+  const isEnabled = Boolean(req.body?.isEnabled)
+  try {
+    const doc = await AlertRule.findOneAndUpdate(
+      { _id: req.params.id, userId, walletAddress: walletAddress.toLowerCase() },
+      { $set: { isEnabled } },
+      { new: true }
+    ).lean()
+    if (!doc) return res.status(404).json({ ok: false, error: 'Rule not found' })
+    return res.json({ ok: true, rule: mapRule(doc) })
+  } catch {
+    return res.status(500).json({ ok: false, error: 'Failed to toggle alert rule' })
+  }
+})
+
+app.delete('/api/alerts/rules/:id', requireAuth, async (req, res) => {
+  if (!assertAlertsReady(res)) return
+  const { userId, walletAddress } = getAuthContext(req)
+  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
+  if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ ok: false, error: 'Rule not found' })
+  try {
+    const deleted = await AlertRule.findOneAndDelete({ _id: req.params.id, userId, walletAddress: walletAddress.toLowerCase() }).lean()
+    if (!deleted) return res.status(404).json({ ok: false, error: 'Rule not found' })
+    return res.json({ ok: true })
+  } catch {
+    return res.status(500).json({ ok: false, error: 'Failed to delete alert rule' })
+  }
+})
+
+app.get('/api/notifications/unread-count', requireAuth, async (req, res) => {
+  if (!assertAlertsReady(res)) return
+  const { userId, walletAddress } = getAuthContext(req)
+  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
+  try {
+    const count = await Notification.countDocuments({ userId, walletAddress: walletAddress.toLowerCase(), status: 'UNREAD' })
+    return res.json({ ok: true, count })
+  } catch {
+    return res.status(500).json({ ok: false, error: 'Failed to fetch unread count' })
+  }
+})
+
+app.get('/api/notifications', requireAuth, async (req, res) => {
+  if (!assertAlertsReady(res)) return
+  const { userId, walletAddress } = getAuthContext(req)
+  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
+  const status = req.query.status ? String(req.query.status) : null
+  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100)
+  const cursor = req.query.cursor ? decodeCursor(req.query.cursor) : null
+  const query = { userId, walletAddress: walletAddress.toLowerCase() }
+  if (status && NOTIFICATION_STATUSES.includes(status)) query.status = status
+  if (cursor) {
+    query.$or = [
+      { createdAt: { $lt: cursor.createdAt } },
+      { createdAt: cursor.createdAt, _id: { $lt: new mongoose.Types.ObjectId(cursor.id) } },
+    ]
+  }
+  try {
+    const docs = await Notification.find(query).sort({ createdAt: -1, _id: -1 }).limit(limit).lean()
+    const nextCursor = docs.length === limit ? encodeCursor(docs[docs.length - 1]) : null
+    return res.json({ ok: true, items: docs.map(mapNotification), nextCursor })
+  } catch {
+    return res.status(500).json({ ok: false, error: 'Failed to list notifications' })
+  }
+})
+
+app.post('/api/notifications/:id/read', requireAuth, async (req, res) => {
+  if (!assertAlertsReady(res)) return
+  const { userId, walletAddress } = getAuthContext(req)
+  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
+  if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ ok: false, error: 'Notification not found' })
+  try {
+    const doc = await Notification.findOneAndUpdate(
+      { _id: req.params.id, userId, walletAddress: walletAddress.toLowerCase() },
+      { $set: { status: 'READ', readAt: new Date() } },
+      { new: true }
+    ).lean()
+    if (!doc) return res.status(404).json({ ok: false, error: 'Notification not found' })
+    return res.json({ ok: true, item: mapNotification(doc) })
+  } catch {
+    return res.status(500).json({ ok: false, error: 'Failed to mark notification read' })
+  }
+})
+
+app.post('/api/notifications/read-all', requireAuth, async (req, res) => {
+  if (!assertAlertsReady(res)) return
+  const { userId, walletAddress } = getAuthContext(req)
+  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
+  try {
+    const result = await Notification.updateMany(
+      { userId, walletAddress: walletAddress.toLowerCase(), status: 'UNREAD' },
+      { $set: { status: 'READ', readAt: new Date() } }
+    )
+    return res.json({ ok: true, updated: result.modifiedCount ?? 0 })
+  } catch {
+    return res.status(500).json({ ok: false, error: 'Failed to mark all notifications read' })
+  }
+})
+
+app.post('/api/notifications/:id/archive', requireAuth, async (req, res) => {
+  if (!assertAlertsReady(res)) return
+  const { userId, walletAddress } = getAuthContext(req)
+  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
+  if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ ok: false, error: 'Notification not found' })
+  try {
+    const doc = await Notification.findOneAndUpdate(
+      { _id: req.params.id, userId, walletAddress: walletAddress.toLowerCase() },
+      { $set: { status: 'ARCHIVED' } },
+      { new: true }
+    ).lean()
+    if (!doc) return res.status(404).json({ ok: false, error: 'Notification not found' })
+    return res.json({ ok: true, item: mapNotification(doc) })
+  } catch {
+    return res.status(500).json({ ok: false, error: 'Failed to archive notification' })
+  }
+})
+
+app.post('/internal/alerts/evaluate-now', async (req, res) => {
+  const key = req.get('x-internal-key')
+  if (!process.env.ALERTS_INTERNAL_KEY || key !== process.env.ALERTS_INTERNAL_KEY) {
+    return res.status(401).json({ ok: false, error: 'Unauthorized' })
+  }
+  if (!assertAlertsReady(res)) return
+
+  const startedAt = Date.now()
+  let evaluatedRules = 0
+  let triggered = 0
+  let createdNotifications = 0
+
+  try {
+    const rules = await AlertRule.find({ isEnabled: true }).lean()
+    evaluatedRules = rules.length
+
+    for (const rule of rules) {
+      const now = Date.now()
+      const cooldownMs = Math.max(Number(rule.cooldownMinutes || 60), 1) * 60 * 1000
+      const lastTriggeredAt = rule.lastTriggeredAt ? new Date(rule.lastTriggeredAt).getTime() : null
+      if (lastTriggeredAt && now - lastTriggeredAt < cooldownMs) continue
+
+      const signal = await evaluateRuleSignal(rule)
+      if (!signal?.triggered) continue
+      triggered += 1
+
+      const timeBucket = Math.floor(now / cooldownMs)
+      const dedupeKey = `trigger:${rule._id}:${timeBucket}`
+      const existing = await AlertEvent.findOne({ dedupeKey }).lean()
+      if (existing) continue
+
+      await AlertEvent.create({
+        alertRuleId: rule._id,
+        dedupeKey,
+        evaluatedAt: new Date(),
+        payload: {
+          kind: 'ALERT_TRIGGER',
+          ruleType: rule.ruleType,
+          metadata: signal.metadata ?? {},
+        },
+      })
+
+      await Notification.create({
+        userId: rule.userId,
+        walletAddress: rule.walletAddress,
+        alertRuleId: rule._id,
+        type: 'ALERT_TRIGGERED',
+        severity: signal.severity || 'WARNING',
+        title: signal.title || 'Alert triggered',
+        message: signal.message || 'Your alert rule was triggered.',
+        metadata: signal.metadata ?? {},
+        status: 'UNREAD',
+      })
+
+      await AlertRule.updateOne({ _id: rule._id }, { $set: { lastTriggeredAt: new Date() } })
+      createdNotifications += 1
+    }
+
+    const durationMs = Date.now() - startedAt
+    alertsWorkerState.lastRunAt = new Date().toISOString()
+    alertsWorkerState.lastDurationMs = durationMs
+    alertsWorkerState.lastSummary = { evaluatedRules, triggered, createdNotifications }
+
+    return res.json({ ok: true, evaluatedRules, triggered, createdNotifications, durationMs })
+  } catch (err) {
+    const durationMs = Date.now() - startedAt
+    alertsWorkerState.lastRunAt = new Date().toISOString()
+    alertsWorkerState.lastDurationMs = durationMs
+    alertsWorkerState.lastSummary = { evaluatedRules, triggered, createdNotifications, error: err?.message || 'unknown' }
+    return res.status(500).json({ ok: false, error: 'Failed to evaluate alerts' })
+  }
+})
+
+app.get('/internal/alerts/health', (_req, res) => {
+  return res.json({
+    ok: true,
+    worker: 'healthy',
+    lastRunAt: alertsWorkerState.lastRunAt,
+    lastDurationMs: alertsWorkerState.lastDurationMs,
+    lastSummary: alertsWorkerState.lastSummary,
+  })
+})
 
 const port = Number(process.env.PORT ?? 3002)
 
