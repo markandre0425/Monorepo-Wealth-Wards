@@ -50,14 +50,8 @@ async function disconnectWalletIfPossible() {
 
 function getLandingUrl(): string {
   const configured = (import.meta.env.VITE_LANDING_URL as string | undefined)?.trim();
-  if (configured) return configured;
-
-  // WW-Dash standalone dev server runs on :5174, while landing runs on :5173.
-  if (window.location.port === "5174") {
-    return `${window.location.protocol}//${window.location.hostname}:5173/`;
-  }
-
-  return "/";
+  // Env-driven default: same-origin root.
+  return configured || window.location.origin;
 }
 
 async function logoutAndRedirectToLanding() {

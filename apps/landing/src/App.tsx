@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef } from 'react'
 import { connect, signMessage, watchConnections } from '@wagmi/core'
-// @ts-ignore
+// @ts-expect-error -- web3-config is a JS module without TypeScript declarations
 import { config, IS_ELECTRON, appKitModal } from './web3-config'
 import { injected } from '@wagmi/connectors'
 import { WagmiAPI } from './services/wagmi-api'
@@ -11,6 +11,12 @@ import './App.css'
 
 // Keep track of SIWE to prevent duplicate triggers
 let siweInProgressCount = 0;
+
+function getDashboardBaseUrl(): string {
+  const configured = (import.meta.env.VITE_DASHBOARD_URL as string | undefined)?.trim();
+  // Env-driven default: if not configured, assume same-origin dashboard path.
+  return configured || window.location.origin;
+}
 
 async function handleSiweFlow(address: string) {
   if (siweInProgressCount > 0) {
@@ -38,7 +44,7 @@ async function handleSiweFlow(address: string) {
     console.log("6b. Verification Result:", result);
 
     if (result.ok) {
-      const dashboardUrl = import.meta.env.VITE_DASHBOARD_URL || "http://localhost:3001";
+      const dashboardUrl = getDashboardBaseUrl();
       const target = dashboardUrl.replace(/\/?$/, "/dashboard/");
       console.log("7. Redirecting to:", target);
       window.location.href = target;
@@ -190,7 +196,7 @@ function App() {
           const session = await WagmiAPI.getWalletSession();
           if (session?.ok && session?.address?.toLowerCase() === address.toLowerCase()) {
             console.info("[App] Active session found for this wallet, redirecting to dashboard...");
-            const dashboardUrl = import.meta.env.VITE_DASHBOARD_URL || "http://localhost:3001";
+            const dashboardUrl = getDashboardBaseUrl();
             const target = dashboardUrl.replace(/\/?$/, "/dashboard/");
             window.location.href = target;
             return;

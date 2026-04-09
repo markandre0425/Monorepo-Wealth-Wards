@@ -5,12 +5,14 @@ const API_BASE = IS_ELECTRON
   : (import.meta.env.VITE_API_URL as string) || "http://localhost:3002";
 
 // Helper to add Electron header if needed
-const getHeaders = (headers: any = {}) => {
-  const h = { ...headers };
+type RequestHeaderMap = Record<string, string>;
+
+const getHeaders = (headers: RequestHeaderMap = {}): RequestHeaderMap => {
+  const requestHeaders: RequestHeaderMap = { ...headers };
   if (IS_ELECTRON) {
-    h['x-electron-app'] = '1';
+    requestHeaders['x-electron-app'] = '1';
   }
-  return h;
+  return requestHeaders;
 };
 
 export const getBalanceFromBackend = async (address: string) => {
@@ -62,13 +64,13 @@ export const WagmiAPI = {
   },
   getWalletSession: async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/auth/session`, {
+      const res = await fetch(`${API_BASE}/api/walletAddress`, {
         headers: getHeaders(),
         credentials: 'include'
       });
       if (!res.ok) return { ok: false };
       return res.json();
-    } catch (err) {
+    } catch {
       return { ok: false };
     }
   }
