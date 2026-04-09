@@ -8,6 +8,10 @@
   ],
   "scripts": {
     "dev": "turbo dev",
+    "dev:runtime": "node scripts/dev-runtime.mjs",
+    "dev:runtime:dry": "node scripts/dev-runtime.mjs --dry-run",
+    "test:e2e:smoke": "node scripts/e2e-siwe-smoke.mjs",
+    "doctor": "node scripts/doctor.mjs",
     "build": "turbo build"
   },
   "devDependencies": {
