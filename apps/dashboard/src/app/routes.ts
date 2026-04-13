@@ -3,10 +3,9 @@ import { createBrowserRouter, useRouteError, isRouteErrorResponse, redirect } fr
 import { RootLayout } from "./components/layout";
 import { getWalletSession } from "./services/wagmi-api";
 
-// When served under /dashboard/ (dev proxy or prod), router needs basename so path "/dashboard/" matches route "/"
-const base = (typeof import.meta.env?.BASE_URL === "string" && import.meta.env.BASE_URL !== "/" && import.meta.env.BASE_URL !== "./")
-  ? import.meta.env.BASE_URL
-  : undefined;
+// Force basename for production deployment under /dashboard.
+// This prevents "No routes matched location '/dashboard/'" when static hosting rewrites to /dashboard/index.html.
+const base = "/dashboard";
 
 function getLandingRedirectUrl(): string {
   const configured = (import.meta.env.VITE_LANDING_URL as string | undefined)?.trim();

@@ -19,38 +19,74 @@ import { ParsedMessage } from '@spruceid/siwe-parser'
 import rateLimit from 'express-rate-limit'
 import Redis from 'ioredis' // optional for nonce (fallback to memory if unavailable)
 import mongoose from 'mongoose' // optional for logs (fallback to file if unavailable)
-import { appendFile, readFile, stat, rename, writeFile } from 'node:fs/promises'
+import { appendFile, readFile, stat, rename } from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
+import {
+ parseCsvOrigins,
+ normalizeOrigin,
+ isPrivateOrLoopbackIp,
+ createCsrfOriginGuard,
+ createInternalRequestVerifier,
+} from './lib/security.js'
+import { createProfileStore } from './lib/profile-store.js'
+import { registerProfileRoutes } from './routes/profile-routes.js'
+import { registerInternalRoutes } from './routes/internal-routes.js'
+import { registerAlertsRoutes } from './routes/alerts-routes.js'
 
 function getManilaTime() {
-  return new Intl.DateTimeFormat('en-US', {
-    timeZone: 'Asia/Manila',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: true
-  }).format(new Date());
+ return new Intl.DateTimeFormat('en-US', {
+  timeZone: 'Asia/Manila',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: true
+ }).format(new Date());
 }
 
 const app = express()
+app.disable('x-powered-by')
+
+const IS_PROD = process.env.NODE_ENV === 'production'
+const ENABLE_CSP_REPORT_ONLY = process.env.ENABLE_CSP_REPORT_ONLY !== 'false'
+const CSP_REPORT_URI = process.env.CSP_REPORT_URI || '/internal/csp-report'
+
+const helmetOptions = {
+ crossOriginEmbedderPolicy: false,
+}
+
+if (ENABLE_CSP_REPORT_ONLY) {
+ helmetOptions.contentSecurityPolicy = {
+  reportOnly: true,
+  useDefaults: true,
+  directives: {
+   defaultSrc: ["'self'"],
+   scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
+   styleSrc: ["'self'", "'unsafe-inline'", 'https:'],
+   imgSrc: ["'self'", 'data:', 'blob:', 'https:'],
+   connectSrc: ["'self'", 'https:', 'wss:', 'ws:'],
+   fontSrc: ["'self'", 'data:', 'https:'],
+   objectSrc: ["'none'"],
+   baseUri: ["'self'"],
+   frameAncestors: ["'none'"],
+   reportUri: [CSP_REPORT_URI],
+  },
+ }
+}
 
 // SECURITY & PERFORMANCE MIDDLEWARE
-app.use(helmet({
-  contentSecurityPolicy: false, // Disable CSP for landing/dashboard dev compatibility if needed
-  crossOriginEmbedderPolicy: false
-}))
+app.use(helmet(helmetOptions))
 app.use(compression()) // Gzip all responses
 
 // Config trust proxy deployment env
 const TRUST_PROXY_SETTING = (() => {
-  const value = process.env.TRUST_PROXY;
-  if (value === 'true') return true;
-  if (value === 'false') return false;
-  if (!isNaN(Number(value))) return Number(value);
-  return value ?? 'loopback'; // Default to 'loopback' for local dev
+ const value = process.env.TRUST_PROXY;
+ if (value === 'true') return true;
+ if (value === 'false') return false;
+ if (!isNaN(Number(value))) return Number(value);
+ return value ?? 'loopback'; // Default to 'loopback' for local dev
 })();
 app.set('trust proxy', TRUST_PROXY_SETTING);
 
@@ -58,29 +94,29 @@ app.set('trust proxy', TRUST_PROXY_SETTING);
 
 let redis = null
 const REDIS_CONFIG = process.env.REDIS_URL || {
-  host: process.env.REDIS_HOST || '127.0.0.1',
-  port: Number(process.env.REDIS_PORT || 6379),
-  retryStrategy: (times) => times > 3 ? null : Math.min(times * 100, 2000),
-  enableOfflineQueue: false,
-  maxRetriesPerRequest: 3
+ host: process.env.REDIS_HOST || '127.0.0.1',
+ port: Number(process.env.REDIS_PORT || 6379),
+ retryStrategy: (times) => times > 3 ? null : Math.min(times * 100, 2000),
+ enableOfflineQueue: false,
+ maxRetriesPerRequest: 3
 }
 
 try {
-  redis = new Redis(REDIS_CONFIG)
-  redis.on('error', (err) => {
-    // Only log if it's the first error to avoid spamming
-    if (!redis._hasErrored) {
-      console.warn('[server] Redis connection failed; falling back to memory/no-cache.', err.message)
-      redis._hasErrored = true
-    }
-  })
-  redis.on('connect', () => {
-    console.log('[server] ✅ Connected to Redis')
-    redis._hasErrored = false
-  })
+ redis = new Redis(REDIS_CONFIG)
+ redis.on('error', (err) => {
+  // Only log if it's the first error to avoid spamming
+  if (!redis._hasErrored) {
+   console.warn('[server] Redis connection failed; falling back to memory/no-cache.', err.message)
+   redis._hasErrored = true
+  }
+ })
+ redis.on('connect', () => {
+  console.log('[server] [OK] Connected to Redis')
+  redis._hasErrored = false
+ })
 } catch (err) {
-  console.error('[server] Redis init failed:', err.message)
-  redis = null
+ console.error('[server] Redis init failed:', err.message)
+ redis = null
 }
 
 const TRANSACTION_TYPES = Object.freeze(['Send', 'Swap', 'Receive', 'Buy'])
@@ -98,101 +134,101 @@ let Notification = null
 let AlertEvent = null
 let mongoReady = false
 if (process.env.MONGO_URI) {
-  mongoose.connection.on('connected', () => {
-    mongoReady = true
-  })
-  mongoose.connection.on('disconnected', () => {
-    mongoReady = false
-  })
-  mongoose.connection.on('error', () => {
-    mongoReady = false
-  })
+ mongoose.connection.on('connected', () => {
+  mongoReady = true
+ })
+ mongoose.connection.on('disconnected', () => {
+  mongoReady = false
+ })
+ mongoose.connection.on('error', () => {
+  mongoReady = false
+ })
 
-  const ActivityLogSchema = new mongoose.Schema({
-    type: {
-      type: String,
-      required: true,
-      enum: ACTIVITY_TYPES,
-      set: (value) => value?.toLowerCase()
-    },
-    address: { type: String, required: true, index: true, lowercase: true },
-    balance: { type: String },
-    chainId: { type: Number },
-    connectorName: { type: String },
-    ip: String,
-    userAgent: String,
-    timestamp: { type: Date, default: Date.now },
-    timestampLocal: { type: String, default: getManilaTime },
-  })
-  ActivityLog = mongoose.models.ActivityLog || mongoose.model('ActivityLog', ActivityLogSchema)
+ const ActivityLogSchema = new mongoose.Schema({
+  type: {
+   type: String,
+   required: true,
+   enum: ACTIVITY_TYPES,
+   set: (value) => value?.toLowerCase()
+  },
+  address: { type: String, required: true, index: true, lowercase: true },
+  balance: { type: String },
+  chainId: { type: Number },
+  connectorName: { type: String },
+  ip: String,
+  userAgent: String,
+  timestamp: { type: Date, default: Date.now },
+  timestampLocal: { type: String, default: getManilaTime },
+ })
+ ActivityLog = mongoose.models.ActivityLog || mongoose.model('ActivityLog', ActivityLogSchema)
 
-  // Separate collection for transaction records (Send, Swap, Receive, Buy)
-  const TransactionLogSchema = new mongoose.Schema({
-    type: { type: String, required: true, enum: [...TRANSACTION_TYPES] },
-    address: { type: String, required: true, index: true, lowercase: true },
-    chainId: { type: Number, default: 1 },
-    connectorName: { type: String, default: null, maxlength: 50 },
-    txHash: { type: String, default: null, match: /^0x[a-fA-F0-9]{64}$/, maxlength: 66 },
-    fromAddress: { type: String, default: null, validate: { validator: (v) => v === null || isAddress(v), message: 'Invalid fromAddress' } },
-    toAddress: { type: String, default: null, validate: { validator: (v) => v === null || isAddress(v), message: 'Invalid toAddress' } },
-    amountEth: { type: String, default: null, maxlength: 50 },
-    blockNumber: { type: Number, default: null },
-    kind: { type: String, default: null, maxlength: 50 },
-    tokenAddress: { type: String, default: null, validate: { validator: (v) => v === null || isAddress(v), message: 'Invalid tokenAddress' } },
-    tokenAmount: { type: String, default: null, maxlength: 50 },
-    ip: { type: String },
-    userAgent: { type: String },
-    timestamp: { type: Date, default: Date.now },
-    timestampLocal: { type: String, default: getManilaTime },
-  })
-  TransactionLogSchema.index({ address: 1, timestamp: -1 })
-  TransactionLogSchema.index({ type: 1 })
-  TransactionLog = mongoose.models.TransactionLog || mongoose.model('TransactionLog', TransactionLogSchema)
+ // Separate collection for transaction records (Send, Swap, Receive, Buy)
+ const TransactionLogSchema = new mongoose.Schema({
+  type: { type: String, required: true, enum: [...TRANSACTION_TYPES] },
+  address: { type: String, required: true, index: true, lowercase: true },
+  chainId: { type: Number, default: 1 },
+  connectorName: { type: String, default: null, maxlength: 50 },
+  txHash: { type: String, default: null, match: /^0x[a-fA-F0-9]{64}$/, maxlength: 66 },
+  fromAddress: { type: String, default: null, validate: { validator: (v) => v === null || isAddress(v), message: 'Invalid fromAddress' } },
+  toAddress: { type: String, default: null, validate: { validator: (v) => v === null || isAddress(v), message: 'Invalid toAddress' } },
+  amountEth: { type: String, default: null, maxlength: 50 },
+  blockNumber: { type: Number, default: null },
+  kind: { type: String, default: null, maxlength: 50 },
+  tokenAddress: { type: String, default: null, validate: { validator: (v) => v === null || isAddress(v), message: 'Invalid tokenAddress' } },
+  tokenAmount: { type: String, default: null, maxlength: 50 },
+  ip: { type: String },
+  userAgent: { type: String },
+  timestamp: { type: Date, default: Date.now },
+  timestampLocal: { type: String, default: getManilaTime },
+ })
+ TransactionLogSchema.index({ address: 1, timestamp: -1 })
+ TransactionLogSchema.index({ type: 1 })
+ TransactionLog = mongoose.models.TransactionLog || mongoose.model('TransactionLog', TransactionLogSchema)
 
-  const AlertRuleSchema = new mongoose.Schema({
-    userId: { type: String, required: true, index: true },
-    walletAddress: { type: String, required: true, index: true, lowercase: true },
-    isEnabled: { type: Boolean, default: true },
-    ruleType: { type: String, required: true, enum: [...ALERT_RULE_TYPES] },
-    target: {
-      assetId: { type: String, required: true },
-      chainId: { type: Number, default: 1 },
-    },
-    condition: {
-      operator: { type: String, required: true, enum: [...ALERT_OPERATORS] },
-      threshold: { type: Number, required: true },
-      windowMinutes: { type: Number, default: null },
-    },
-    cooldownMinutes: { type: Number, default: 60 },
-    lastTriggeredAt: { type: Date, default: null },
-  }, { timestamps: true })
-  AlertRuleSchema.index({ userId: 1, walletAddress: 1, isEnabled: 1 })
-  AlertRule = mongoose.models.AlertRule || mongoose.model('AlertRule', AlertRuleSchema)
+ const AlertRuleSchema = new mongoose.Schema({
+  userId: { type: String, required: true, index: true },
+  walletAddress: { type: String, required: true, index: true, lowercase: true },
+  isEnabled: { type: Boolean, default: true },
+  ruleType: { type: String, required: true, enum: [...ALERT_RULE_TYPES] },
+  target: {
+   assetId: { type: String, required: true },
+   chainId: { type: Number, default: 1 },
+  },
+  condition: {
+   operator: { type: String, required: true, enum: [...ALERT_OPERATORS] },
+   threshold: { type: Number, required: true },
+   windowMinutes: { type: Number, default: null },
+  },
+  cooldownMinutes: { type: Number, default: 60 },
+  lastTriggeredAt: { type: Date, default: null },
+ }, { timestamps: true })
+ AlertRuleSchema.index({ userId: 1, walletAddress: 1, isEnabled: 1 })
+ AlertRule = mongoose.models.AlertRule || mongoose.model('AlertRule', AlertRuleSchema)
 
-  const NotificationSchema = new mongoose.Schema({
-    userId: { type: String, required: true, index: true },
-    walletAddress: { type: String, required: true, index: true, lowercase: true },
-    alertRuleId: { type: mongoose.Schema.Types.ObjectId, ref: 'AlertRule', default: null, index: true },
-    type: { type: String, required: true, enum: [...NOTIFICATION_TYPES], default: 'ALERT_TRIGGERED' },
-    severity: { type: String, required: true, enum: [...NOTIFICATION_SEVERITIES], default: 'INFO' },
-    title: { type: String, required: true, maxlength: 160 },
-    message: { type: String, required: true, maxlength: 1000 },
-    metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
-    status: { type: String, required: true, enum: [...NOTIFICATION_STATUSES], default: 'UNREAD', index: true },
-    readAt: { type: Date, default: null },
-  }, { timestamps: { createdAt: true, updatedAt: false } })
-  NotificationSchema.index({ userId: 1, status: 1, createdAt: -1 })
-  Notification = mongoose.models.Notification || mongoose.model('Notification', NotificationSchema)
+ const NotificationSchema = new mongoose.Schema({
+  userId: { type: String, required: true, index: true },
+  walletAddress: { type: String, required: true, index: true, lowercase: true },
+  alertRuleId: { type: mongoose.Schema.Types.ObjectId, ref: 'AlertRule', default: null, index: true },
+  type: { type: String, required: true, enum: [...NOTIFICATION_TYPES], default: 'ALERT_TRIGGERED' },
+  severity: { type: String, required: true, enum: [...NOTIFICATION_SEVERITIES], default: 'INFO' },
+  title: { type: String, required: true, maxlength: 160 },
+  message: { type: String, required: true, maxlength: 1000 },
+  metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
+  status: { type: String, required: true, enum: [...NOTIFICATION_STATUSES], default: 'UNREAD', index: true },
+  readAt: { type: Date, default: null },
+ }, { timestamps: { createdAt: true, updatedAt: false } })
+ NotificationSchema.index({ userId: 1, status: 1, createdAt: -1 })
+ Notification = mongoose.models.Notification || mongoose.model('Notification', NotificationSchema)
 
-  const AlertEventSchema = new mongoose.Schema({
-    alertRuleId: { type: mongoose.Schema.Types.ObjectId, ref: 'AlertRule', required: true, index: true },
-    dedupeKey: { type: String, required: true, unique: true, index: true },
-    evaluatedAt: { type: Date, default: Date.now, index: true },
-    payload: { type: mongoose.Schema.Types.Mixed, default: {} },
-  }, { timestamps: true })
-  AlertEvent = mongoose.models.AlertEvent || mongoose.model('AlertEvent', AlertEventSchema)
+ const AlertEventSchema = new mongoose.Schema({
+  alertRuleId: { type: mongoose.Schema.Types.ObjectId, ref: 'AlertRule', required: true, index: true },
+  dedupeKey: { type: String, required: true, unique: true, index: true },
+  evaluatedAt: { type: Date, default: Date.now, index: true },
+  payload: { type: mongoose.Schema.Types.Mixed, default: {} },
+ }, { timestamps: true })
+ AlertEvent = mongoose.models.AlertEvent || mongoose.model('AlertEvent', AlertEventSchema)
 } else {
-  console.log('MONGO_URI not set; activity logs will use file fallback.')
+ console.log('MONGO_URI not set; activity logs will use file fallback.')
 }
 // ------------------------------------------------------------------
 
@@ -200,29 +236,28 @@ const ACTIVITY_LOG_PATH = join(__dirname, 'activity.txt')
 
 
 const JWT_SECRET = process.env.JWT_SECRET ?? 'dev-secret-change-me'
-const IS_PROD = process.env.NODE_ENV === 'production'
 
 if (!IS_PROD) {
-  console.log(`Trust proxy set to: ${TRUST_PROXY_SETTING}`)
+ console.log(`Trust proxy set to: ${TRUST_PROXY_SETTING}`)
 }
 
 if (IS_PROD && (!process.env.JWT_SECRET || process.env.JWT_SECRET === 'dev-secret-change-me')) {
-  console.error('Fatal: Set JWT_SECRET to a strong random value in production.')
-  process.exit(1)
+ console.error('Fatal: Set JWT_SECRET to a strong random value in production.')
+ process.exit(1)
 }
 
-// Public clients for balance lookups (per chain). Sepolia default avoids rpc.sepolia.org (often slow/timeout).
-const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || 'oKsh3Sa8Xm98u-B_EuQSXYA5n93ZzThE'
+// Public clients for balance lookups (per chain).
+// Explicit env RPC endpoints are preferred; fallback stays non-Alchemy to avoid key-coupled regressions.
 const rpcByChain = {
-  [mainnet.id]: process.env.RPC_URL || `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`,
-  [sepolia.id]: process.env.SEPOLIA_RPC_URL || `https://eth-sepolia.g.alchemy.com/v2/${ALCHEMY_KEY}`,
+ [mainnet.id]: process.env.RPC_URL || 'https://ethereum-rpc.publicnode.com',
+ [sepolia.id]: process.env.SEPOLIA_RPC_URL || 'https://ethereum-sepolia-rpc.publicnode.com',
 }
 const publicClients = {
-  [mainnet.id]: createPublicClient({ chain: mainnet, transport: http(rpcByChain[mainnet.id]) }),
-  [sepolia.id]: createPublicClient({ chain: sepolia, transport: http(rpcByChain[sepolia.id]) }),
+ [mainnet.id]: createPublicClient({ chain: mainnet, transport: http(rpcByChain[mainnet.id]) }),
+ [sepolia.id]: createPublicClient({ chain: sepolia, transport: http(rpcByChain[sepolia.id]) }),
 }
 function getPublicClient(chainId) {
-  return publicClients[chainId] ?? publicClients[mainnet.id]
+ return publicClients[chainId] ?? publicClients[mainnet.id]
 }
 
 // Client IP for logging: with trust proxy, req.ip is from X-Forwarded-For (end user);
@@ -230,58 +265,92 @@ function getPublicClient(chainId) {
 const IPV4_OCTET = '(?:25[0-5]|2[0-4]\\d|1\\d{2}|[1-9]?\\d)'
 const IPV4_MAPPED_IPv6 = new RegExp(`^::ffff:(${IPV4_OCTET}(?:\\.${IPV4_OCTET}){3})$`)
 function getClientIp(req) {
-  const raw = req.ip || req.socket?.remoteAddress || 'unknown'
-  const match = raw.match(IPV4_MAPPED_IPv6)
-  return match ? match[1] : raw
+ const raw = req.ip || req.socket?.remoteAddress || 'unknown'
+ const match = raw.match(IPV4_MAPPED_IPv6)
+ return match ? match[1] : raw
+}
+
+const DEV_CORS_ORIGINS = [
+ 'http://localhost:3000', // Landing
+ 'http://localhost:3001', // Dashboard
+ 'http://127.0.0.1:3000',
+ 'http://127.0.0.1:3001',
+]
+
+const ENV_CORS_ORIGINS = [
+ ...parseCsvOrigins(process.env.CORS_ALLOWED_ORIGINS),
+ process.env.WEB_ORIGIN,
+ process.env.ELECTRON_ORIGIN,
+ process.env.VITE_API_URL,
+ process.env.VITE_API_URL_ELECTRON,
+].filter(Boolean).map((origin) => normalizeOrigin(String(origin)))
+
+const CORS_ALLOWLIST = new Set([...DEV_CORS_ORIGINS, ...ENV_CORS_ORIGINS])
+const ALLOW_NULL_ORIGIN = !IS_PROD || process.env.ALLOW_NULL_ORIGIN === 'true'
+const CSRF_ORIGIN_CHECK_DISABLED = process.env.DISABLE_CSRF_ORIGIN_CHECK === 'true'
+const INTERNAL_HMAC_SECRET = process.env.ALERTS_INTERNAL_HMAC_SECRET || ''
+
+const csrfOriginGuard = createCsrfOriginGuard({
+ isProd: IS_PROD,
+ allowNullOrigin: ALLOW_NULL_ORIGIN,
+ disableCheck: CSRF_ORIGIN_CHECK_DISABLED,
+ corsAllowlist: CORS_ALLOWLIST,
+})
+
+const verifyInternalRequest = createInternalRequestVerifier({
+ staticKey: process.env.ALERTS_INTERNAL_KEY || '',
+ hmacSecret: INTERNAL_HMAC_SECRET,
+})
+
+function requireInternalSource(req, res, next) {
+ const clientIp = getClientIp(req)
+ if (isPrivateOrLoopbackIp(clientIp)) return next()
+ return res.status(403).json({ ok: false, error: 'Forbidden' })
 }
 
 function requireAuth(req, res, next) {
-  const token = req.cookies?.token
-  if (!token) return res.status(401).json({ ok: false, error: 'Not logged in' })
-  try {
-    const payload = jwt.verify(token, JWT_SECRET)
-    const isWallet = typeof payload.sub === 'string' && payload.sub.startsWith('0x') && isAddress(payload.sub)
-    req.user = {
-      address: isWallet ? payload.sub : null,
-      provider: payload.provider ?? null,
-      email: payload.email ?? null,
-      name: payload.name ?? null,
-      sub: payload.sub,
-    }
-    return next()
-  } catch (err) {
-    console.error('requireAuth: JWT verification failed:', err.message)
-    return res.status(401).json({ ok: false, error: 'Invalid/expired token' })
+ const token = req.cookies?.token
+ if (!token) return res.status(401).json({ ok: false, error: 'Not logged in' })
+ try {
+  const payload = jwt.verify(token, JWT_SECRET)
+  const isWallet = typeof payload.sub === 'string' && payload.sub.startsWith('0x') && isAddress(payload.sub)
+  req.user = {
+   address: isWallet ? payload.sub : null,
+   provider: payload.provider ?? null,
+   email: payload.email ?? null,
+   name: payload.name ?? null,
+   chainId: payload.chainId != null && Number.isFinite(Number(payload.chainId)) ? Number(payload.chainId) : null,
+   sub: payload.sub,
   }
+  return next()
+ } catch (err) {
+  console.error('requireAuth: JWT verification failed:', err.message)
+  return res.status(401).json({ ok: false, error: 'Invalid/expired token' })
+ }
 }
 
 app.use(cors({
-  origin(origin, callback) {
-    if (!origin) return callback(null, true)
-    if (origin === 'null') return callback(null, true)
+ origin(origin, callback) {
+  if (!origin) return callback(null, true)
+  if (origin === 'null') return callback(null, ALLOW_NULL_ORIGIN)
 
-    const allowedManualOrigins = [
-      'http://localhost:3000', // Landing
-      'http://localhost:3001', // Dashboard
-      'http://127.0.0.1:3000',
-      'http://127.0.0.1:3001'
-    ];
+  const normalizedOrigin = origin.endsWith('/') ? origin.slice(0, -1) : origin
+  if (CORS_ALLOWLIST.has(normalizedOrigin)) return callback(null, true)
 
-    if (allowedManualOrigins.includes(origin)) return callback(null, true);
+  // Keep your existing Vite dev server logic as a backup
+  if (!IS_PROD && /^http:\/\/(localhost|127\.0\.0\.1)/.test(origin)) return callback(null, true)
 
-    // Keep your existing Vite dev server logic as a backup
-    if (!IS_PROD && /^http:\/\/(localhost|127\.0\.0\.1)/.test(origin)) return callback(null, true)
-
-    return callback(null, false)
-  },
-  credentials: true,
+  return callback(null, false)
+ },
+ credentials: true,
 }))
-// Increase JSON limit to handle large avatar data URLs (up to 10MB)
+// JSON body limit supports profile avatar data URLs (up to ~10MB payloads).
 app.use(express.json({ limit: '10mb' }))
 app.use(cookieParser())
+app.use('/api', csrfOriginGuard)
 
 app.get('/api/health', (_req, res) => {
-  return res.json({ ok: true, status: 'healthy', service: 'wagmi-backend' })
+ return res.json({ ok: true, status: 'healthy', service: 'wagmi-backend' })
 })
 
 // UPDATED NONCE LOGIC (Redis if available, else in-memory)
@@ -298,70 +367,70 @@ const PENDING_NONCE_KEY = (nonce) => `pending-nonce:${nonce}`
 
 // SIWE EIP-4361 requires nonce to be 8*( ALPHA / DIGIT ) — alphanumeric only (no hyphens)
 function generateSiweNonce() {
-  return randomBytes(16).toString('hex')
+ return randomBytes(16).toString('hex')
 }
 
 async function issueNonce(address) {
-  const nonce = generateSiweNonce()
-  const key = getNonceKey(address, nonce)
+ const nonce = generateSiweNonce()
+ const key = getNonceKey(address, nonce)
 
-  if (redis) {
-    try {
-      await redis.set(key, nonce, 'EX', NONCE_TTL_SECONDS)
-      return { nonce, expiresAt: Date.now() + NONCE_TTL_SECONDS * 1000 }
-    } catch (err) {
-      // Fallback to memory below if redis fails
-    }
+ if (redis) {
+  try {
+   await redis.set(key, nonce, 'EX', NONCE_TTL_SECONDS)
+   return { nonce, expiresAt: Date.now() + NONCE_TTL_SECONDS * 1000 }
+  } catch (err) {
+   // Fallback to memory below if redis fails
   }
+ }
 
-  const expiresAt = Date.now() + NONCE_TTL_SECONDS * 1000
-  nonceMemory.set(key, { nonce, expiresAt })
-  return { nonce, expiresAt }
+ const expiresAt = Date.now() + NONCE_TTL_SECONDS * 1000
+ nonceMemory.set(key, { nonce, expiresAt })
+ return { nonce, expiresAt }
 }
 
 async function takeNonce(address, nonce) {
-  const key = getNonceKey(address, nonce)
+ const key = getNonceKey(address, nonce)
 
-  if (redis) {
-    try {
-      // Atomic get-and-delete so two concurrent verifies cannot consume the same nonce
-      const stored = await redis.getdel(key)
-      if (stored) return stored === nonce ? nonce : null
-    } catch (err) {
-      // Fallback to memory below
-    }
+ if (redis) {
+  try {
+   // Atomic get-and-delete so two concurrent verifies cannot consume the same nonce
+   const stored = await redis.getdel(key)
+   if (stored) return stored === nonce ? nonce : null
+  } catch (err) {
+   // Fallback to memory below
   }
+ }
 
-  const entry = nonceMemory.get(key)
-  nonceMemory.delete(key)
-  if (!entry) return null
-  if (Date.now() > entry.expiresAt) return null
-  return entry.nonce === nonce ? nonce : null
+ const entry = nonceMemory.get(key)
+ nonceMemory.delete(key)
+ if (!entry) return null
+ if (Date.now() > entry.expiresAt) return null
+ return entry.nonce === nonce ? nonce : null
 }
 
 // Periodic cleanup of expired in-memory nonces (when Redis is not used)
 if (!redis) {
-  const NONCE_CLEANUP_INTERVAL_MS = 60 * 1000
-  setInterval(() => {
-    const now = Date.now()
-    const toDelete = []
-    for (const [key, entry] of nonceMemory.entries()) {
-      if (now > entry.expiresAt) toDelete.push(key)
-    }
-    for (const key of toDelete) nonceMemory.delete(key)
-  }, NONCE_CLEANUP_INTERVAL_MS)
+ const NONCE_CLEANUP_INTERVAL_MS = 60 * 1000
+ setInterval(() => {
+  const now = Date.now()
+  const toDelete = []
+  for (const [key, entry] of nonceMemory.entries()) {
+   if (now > entry.expiresAt) toDelete.push(key)
+  }
+  for (const key of toDelete) nonceMemory.delete(key)
+ }, NONCE_CLEANUP_INTERVAL_MS)
 }
 // ------------------------------------------------------------------
 
 // Helper to check if log file is empty (for adding headers)
 async function isLogFileEmpty() {
-  try {
-    const stats = await stat(ACTIVITY_LOG_PATH)
-    return stats.size === 0
-  } catch (err) {
-    console.error('isLogFileEmpty: stat failed:', err.message)
-    return true // file doesn't exist yet
-  }
+ try {
+  const stats = await stat(ACTIVITY_LOG_PATH)
+  return stats.size === 0
+ } catch (err) {
+  console.error('isLogFileEmpty: stat failed:', err.message)
+  return true // file doesn't exist yet
+ }
 }
 
 const SIWE_STATEMENT = 'Sign in with Ethereum to Wealth Wards.'
@@ -380,498 +449,498 @@ const INTERNAL_RATE_LIMIT_MAX = Number(process.env.INTERNAL_RATE_LIMIT_MAX || 12
 const limiterKey = (req) => getClientIp(req)
 
 function limiterUserKey(req) {
-  const cookieToken = req.cookies?.token
-  if (!cookieToken) return 'anon'
-  try {
-    const payload = jwt.verify(cookieToken, JWT_SECRET)
-    return String(payload?.sub || payload?.address || 'anon').toLowerCase()
-  } catch {
-    return 'anon'
-  }
+ const cookieToken = req.cookies?.token
+ if (!cookieToken) return 'anon'
+ try {
+  const payload = jwt.verify(cookieToken, JWT_SECRET)
+  return String(payload?.sub || payload?.address || 'anon').toLowerCase()
+ } catch {
+  return 'anon'
+ }
 }
 
 function hybridLimiterKey(req, scope = 'hybrid') {
-  return `${limiterKey(req)}:${limiterUserKey(req)}:${scope}`
+ return `${limiterKey(req)}:${limiterUserKey(req)}:${scope}`
 }
 
 const globalApiLimiter = rateLimit({
-  windowMs: GLOBAL_RATE_LIMIT_WINDOW_MS,
-  limit: GLOBAL_RATE_LIMIT_MAX,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => hybridLimiterKey(req, 'global'),
-  message: { ok: false, error: 'Too many requests' },
+ windowMs: GLOBAL_RATE_LIMIT_WINDOW_MS,
+ limit: GLOBAL_RATE_LIMIT_MAX,
+ standardHeaders: true,
+ legacyHeaders: false,
+ keyGenerator: (req) => hybridLimiterKey(req, 'global'),
+ message: { ok: false, error: 'Too many requests' },
 })
 
 const mutationApiLimiter = rateLimit({
-  windowMs: MUTATION_RATE_LIMIT_WINDOW_MS,
-  limit: MUTATION_RATE_LIMIT_MAX,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => `${hybridLimiterKey(req, 'mutation')}:${req.method}`,
-  message: { ok: false, error: 'Too many write requests' },
+ windowMs: MUTATION_RATE_LIMIT_WINDOW_MS,
+ limit: MUTATION_RATE_LIMIT_MAX,
+ standardHeaders: true,
+ legacyHeaders: false,
+ keyGenerator: (req) => `${hybridLimiterKey(req, 'mutation')}:${req.method}`,
+ message: { ok: false, error: 'Too many write requests' },
 })
 
 const internalLimiter = rateLimit({
-  windowMs: INTERNAL_RATE_LIMIT_WINDOW_MS,
-  limit: INTERNAL_RATE_LIMIT_MAX,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => hybridLimiterKey(req, 'internal'),
-  message: { ok: false, error: 'Too many internal requests' },
+ windowMs: INTERNAL_RATE_LIMIT_WINDOW_MS,
+ limit: INTERNAL_RATE_LIMIT_MAX,
+ standardHeaders: true,
+ legacyHeaders: false,
+ keyGenerator: (req) => hybridLimiterKey(req, 'internal'),
+ message: { ok: false, error: 'Too many internal requests' },
 })
 
 const expensiveReadLimiter = rateLimit({
-  windowMs: Number(process.env.EXPENSIVE_READ_LIMIT_WINDOW_MS || 60 * 1000),
-  limit: Number(process.env.EXPENSIVE_READ_LIMIT_MAX || 40),
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => hybridLimiterKey(req, 'expensive'),
-  message: { ok: false, error: 'Too many expensive read requests' },
+ windowMs: Number(process.env.EXPENSIVE_READ_LIMIT_WINDOW_MS || 60 * 1000),
+ limit: Number(process.env.EXPENSIVE_READ_LIMIT_MAX || 40),
+ standardHeaders: true,
+ legacyHeaders: false,
+ keyGenerator: (req) => hybridLimiterKey(req, 'expensive'),
+ message: { ok: false, error: 'Too many expensive read requests' },
 })
 
 const authLimiter = rateLimit({
-  windowMs: 5 * 60 * 1000,
-  limit: 50,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => hybridLimiterKey(req, 'auth'),
+ windowMs: 5 * 60 * 1000,
+ limit: 50,
+ standardHeaders: true,
+ legacyHeaders: false,
+ keyGenerator: (req) => hybridLimiterKey(req, 'auth'),
 })
 
 const strictAuthLimiter = rateLimit({
-  windowMs: 5 * 60 * 1000,
-  limit: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => hybridLimiterKey(req, 'strict-auth'),
+ windowMs: 5 * 60 * 1000,
+ limit: 20,
+ standardHeaders: true,
+ legacyHeaders: false,
+ keyGenerator: (req) => hybridLimiterKey(req, 'strict-auth'),
 })
 
 app.use('/api', globalApiLimiter)
 app.use('/api', (req, res, next) => {
-  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
-    return mutationApiLimiter(req, res, next)
-  }
-  return next()
+ if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+  return mutationApiLimiter(req, res, next)
+ }
+ return next()
 })
-app.use('/internal', internalLimiter)
+app.use('/internal', requireInternalSource, internalLimiter)
 
 // Helper: Extract Nonce from Message
 function extractNonceFromMessage(message) {
-  const match = message.match(/^Nonce:\s*(.+)$/m)
-  return match?.[1]?.trim() ?? null
+ const match = message.match(/^Nonce:\s*(.+)$/m)
+ return match?.[1]?.trim() ?? null
 }
 
 // API: Get Nonce (requires address)
 app.get('/api/nonce', authLimiter, async (req, res) => {
-  const address = String(req.query.address ?? '')
-  if (!isAddress(address)) return res.status(400).json({ error: 'Invalid address' })
+ const address = String(req.query.address ?? '')
+ if (!isAddress(address)) return res.status(400).json({ error: 'Invalid address' })
 
-  try {
-    const { nonce, expiresAt } = await issueNonce(address)
-    res.json({ address, nonce, expiresAt })
-  } catch (err) {
-    console.error('Redis error:', err)
-    return res.status(500).json({ error: 'Internal server error' })
-  }
+ try {
+  const { nonce, expiresAt } = await issueNonce(address)
+  res.json({ address, nonce, expiresAt })
+ } catch (err) {
+  console.error('Redis error:', err)
+  return res.status(500).json({ error: 'Internal server error' })
+ }
 })
 
 // API: Address-independent nonce for Reown AppKit SIWE flow
 // AppKit calls getNonce() BEFORE the wallet is connected, so an address-free endpoint is required.
 app.get('/api/siwe/nonce', authLimiter, async (req, res) => {
-  try {
-    const nonce = generateSiweNonce()
-    const expiresAt = Date.now() + NONCE_TTL_SECONDS * 1000
-    const key = PENDING_NONCE_KEY(nonce)
+ try {
+  const nonce = generateSiweNonce()
+  const expiresAt = Date.now() + NONCE_TTL_SECONDS * 1000
+  const key = PENDING_NONCE_KEY(nonce)
 
-    if (redis) {
-      try {
-        await redis.set(key, nonce, 'EX', NONCE_TTL_SECONDS)
-      } catch {
-        pendingNonceMemory.set(key, { nonce, expiresAt })
-      }
-    } else {
-      pendingNonceMemory.set(key, { nonce, expiresAt })
-    }
-
-    res.json({ nonce, expiresAt })
-  } catch (err) {
-    console.error('SIWE nonce error:', err)
-    return res.status(500).json({ error: 'Internal server error' })
+  if (redis) {
+   try {
+    await redis.set(key, nonce, 'EX', NONCE_TTL_SECONDS)
+   } catch {
+    pendingNonceMemory.set(key, { nonce, expiresAt })
+   }
+  } else {
+   pendingNonceMemory.set(key, { nonce, expiresAt })
   }
+
+  res.json({ nonce, expiresAt })
+ } catch (err) {
+  console.error('SIWE nonce error:', err)
+  return res.status(500).json({ error: 'Internal server error' })
+ }
 })
 
 // API: SIWE Message (Sign-In With Ethereum)
 app.get('/api/siwe/message', authLimiter, async (req, res) => {
-  const address = String(req.query.address ?? '')
-  const chainId = Number(req.query.chainId ?? mainnet.id)
-  const uri = String(req.query.uri ?? '')
+ const address = String(req.query.address ?? '')
+ const chainId = Number(req.query.chainId ?? mainnet.id)
+ const uri = String(req.query.uri ?? '')
 
-  if (!isAddress(address)) return res.status(400).json({ ok: false, error: 'Invalid address' })
-  const chainIdInt = Number.isFinite(chainId) ? Math.floor(chainId) : mainnet.id
-  if (!ALLOWED_CHAIN_IDS.has(chainIdInt)) return res.status(400).json({ ok: false, error: 'Unsupported chainId' })
+ if (!isAddress(address)) return res.status(400).json({ ok: false, error: 'Invalid address' })
+ const chainIdInt = Number.isFinite(chainId) ? Math.floor(chainId) : mainnet.id
+ if (!ALLOWED_CHAIN_IDS.has(chainIdInt)) return res.status(400).json({ ok: false, error: 'Unsupported chainId' })
 
-  let domain
-  try {
-    domain = new URL(uri).host
-  } catch (err) {
-    console.error('SIWE message: invalid uri:', err.message)
-    return res.status(400).json({ ok: false, error: 'Invalid uri' })
-  }
+ let domain
+ try {
+  domain = new URL(uri).host
+ } catch (err) {
+  console.error('SIWE message: invalid uri:', err.message)
+  return res.status(400).json({ ok: false, error: 'Invalid uri' })
+ }
 
-  try {
-    const { nonce } = await issueNonce(address)
-    const issuedAt = new Date()
-    const expirationTime = new Date(issuedAt.getTime() + SIWE_TTL_MS)
+ try {
+  const { nonce } = await issueNonce(address)
+  const issuedAt = new Date()
+  const expirationTime = new Date(issuedAt.getTime() + SIWE_TTL_MS)
 
-    const msg = new SiweMessage({
-      domain,
-      address: getAddress(address),
-      statement: SIWE_STATEMENT,
-      uri,
-      version: '1',
-      chainId: chainIdInt,
-      nonce,
-      issuedAt: issuedAt.toISOString(),
-      expirationTime: expirationTime.toISOString(),
-      notBefore: issuedAt.toISOString(),
-    })
+  const msg = new SiweMessage({
+   domain,
+   address: getAddress(address),
+   statement: SIWE_STATEMENT,
+   uri,
+   version: '1',
+   chainId: chainIdInt,
+   nonce,
+   issuedAt: issuedAt.toISOString(),
+   expirationTime: expirationTime.toISOString(),
+   notBefore: issuedAt.toISOString(),
+  })
 
-    return res.json({ ok: true, message: msg.prepareMessage(), nonce })
-  } catch (err) {
-    console.error('SIWE generation error:', err)
-    return res.status(500).json({ ok: false, error: 'Internal error' })
-  }
+  return res.json({ ok: true, message: msg.prepareMessage(), nonce })
+ } catch (err) {
+  console.error('SIWE generation error:', err)
+  return res.status(500).json({ ok: false, error: 'Internal error' })
+ }
 })
 
 // API: SIWE Verify
 app.post('/api/siwe/verify', strictAuthLimiter, async (req, res) => {
-  const { message, signature } = req.body ?? {}
-  if (!message || !signature) return res.status(400).json({ ok: false, error: 'Missing data' })
-  if (typeof message !== 'string') return res.status(400).json({ ok: false, error: 'Invalid SIWE message: expected EIP-4361 string' })
+ const { message, signature } = req.body ?? {}
+ if (!message || !signature) return res.status(400).json({ ok: false, error: 'Missing data' })
+ if (typeof message !== 'string') return res.status(400).json({ ok: false, error: 'Invalid SIWE message: expected EIP-4361 string' })
 
-  let siwe
-  try {
-    const parsed = new ParsedMessage(message)
-    siwe = new SiweMessage({
-      scheme: parsed.scheme,
-      domain: parsed.domain,
-      address: parsed.address,
-      statement: parsed.statement,
-      uri: parsed.uri,
-      version: parsed.version,
-      chainId: parsed.chainId,
-      nonce: parsed.nonce,
-      issuedAt: parsed.issuedAt,
-      expirationTime: parsed.expirationTime,
-      notBefore: parsed.notBefore,
-      requestId: parsed.requestId,
-      resources: parsed.resources,
-    })
-  } catch (err) {
-    console.error('SIWE verify: invalid message format:', err.message)
-    return res.status(400).json({ ok: false, error: 'Invalid SIWE message' })
-  }
-
-  // Standard SIWE field checks 
-  if (siwe.version !== '1') return res.status(400).json({ ok: false, error: 'Invalid SIWE version' })
-  if (siwe.statement !== SIWE_STATEMENT) return res.status(400).json({ ok: false, error: 'Invalid SIWE statement' })
-  if (!isAddress(siwe.address)) return res.status(400).json({ ok: false, error: 'Invalid address' })
-  const verifyChainId = Number(siwe.chainId)
-  const verifyChainIdInt = Number.isFinite(verifyChainId) ? Math.floor(verifyChainId) : 0
-  if (!ALLOWED_CHAIN_IDS.has(verifyChainIdInt)) return res.status(400).json({ ok: false, error: 'Unsupported chainId' })
-
-  // Validate expected frontend origin/domain (must match CORS: 5170-5179 in dev)
-  const isElectron = req.headers['x-electron-app'] === '1'
-  const allowedOrigins = new Set()
-  if (process.env.WEB_ORIGIN) allowedOrigins.add(process.env.WEB_ORIGIN)
-  // Electron desktop app may use a different API origin as the SIWE uri
-  if (process.env.ELECTRON_ORIGIN) allowedOrigins.add(process.env.ELECTRON_ORIGIN)
-  // Accept VITE_API_URL / VITE_API_URL_ELECTRON so the frontend's SIWE uri
-  // is recognised even when WEB_ORIGIN or ELECTRON_ORIGIN aren't set to
-  // the same value (common in same-origin deployments and Electron).
-  if (process.env.VITE_API_URL) allowedOrigins.add(process.env.VITE_API_URL)
-  if (process.env.VITE_API_URL_ELECTRON) allowedOrigins.add(process.env.VITE_API_URL_ELECTRON)
-  if (!IS_PROD) {
-    for (let p = 5170; p <= 5179; p++) {
-      allowedOrigins.add(`http://localhost:${p}`)
-      allowedOrigins.add(`http://127.0.0.1:${p}`)
-    }
-    allowedOrigins.add('http://localhost:3000')
-    allowedOrigins.add('http://localhost:3001')
-    // Dev Electron uses the local API server as SIWE uri
-    allowedOrigins.add('http://localhost:3001')
-  }
-
-  if (IS_PROD && allowedOrigins.size === 0) {
-    return res.status(503).json({ ok: false, error: 'Server misconfiguration: WEB_ORIGIN required in production' })
-  }
-
-  let msgOrigin
-  try {
-    msgOrigin = new URL(siwe.uri).origin
-  } catch (err) {
-    console.error('SIWE verify: invalid uri in message:', err.message)
-    return res.status(400).json({ ok: false, error: 'Invalid uri in SIWE message' })
-  }
-  if (!allowedOrigins.has(msgOrigin)) {
-    return res.status(400).json({ ok: false, error: `Invalid origin: ${msgOrigin}` })
-  }
-  const expectedDomain = new URL(msgOrigin).host
-  if (siwe.domain !== expectedDomain) {
-    return res.status(400).json({ ok: false, error: 'SIWE domain mismatch' })
-  }
-
-  // Time window checks (prevents old/future messages)
-  const now = Date.now()
-  const issuedAtMs = Date.parse(siwe.issuedAt || '')
-  if (!Number.isFinite(issuedAtMs)) return res.status(400).json({ ok: false, error: 'Invalid issuedAt' })
-  if (issuedAtMs > now + SIWE_CLOCK_SKEW_MS) return res.status(400).json({ ok: false, error: 'issuedAt is in the future' })
-  if (now - issuedAtMs > SIWE_TTL_MS + SIWE_CLOCK_SKEW_MS) return res.status(400).json({ ok: false, error: 'SIWE message too old' })
-
-  const expirationMs = Date.parse(siwe.expirationTime || '')
-  if (!Number.isFinite(expirationMs)) return res.status(400).json({ ok: false, error: 'Missing/invalid expirationTime' })
-  if (now > expirationMs + SIWE_CLOCK_SKEW_MS) return res.status(400).json({ ok: false, error: 'SIWE message expired' })
-
-  if (siwe.notBefore) {
-    const notBeforeMs = Date.parse(siwe.notBefore)
-    if (!Number.isFinite(notBeforeMs)) return res.status(400).json({ ok: false, error: 'Invalid notBefore' })
-    if (now + SIWE_CLOCK_SKEW_MS < notBeforeMs) return res.status(400).json({ ok: false, error: 'SIWE message not active yet' })
-  }
-
-  // Consume nonce BEFORE signature verification (anti-replay).
-  // Trade-off: a bad signature burns the nonce, forcing the user to request a
-  // new SIWE message. This is intentional — it prevents an attacker from
-  // replaying a valid nonce with forged signatures in a retry loop.
-  // Check both address-keyed nonces (from /api/nonce) AND pending nonces (from /api/siwe/nonce used by Reown AppKit)
-  const nonceValid = await takeNonce(siwe.address, siwe.nonce)
-  let pendingNonceValid = false
-  if (!nonceValid) {
-    const pendingKey = PENDING_NONCE_KEY(siwe.nonce)
-    if (redis) {
-      try {
-        const stored = await redis.getdel(pendingKey)
-        pendingNonceValid = stored === siwe.nonce
-      } catch {
-        const entry = pendingNonceMemory.get(pendingKey)
-        pendingNonceMemory.delete(pendingKey)
-        pendingNonceValid = !!(entry && Date.now() <= entry.expiresAt && entry.nonce === siwe.nonce)
-      }
-    } else {
-      const entry = pendingNonceMemory.get(pendingKey)
-      pendingNonceMemory.delete(pendingKey)
-      pendingNonceValid = !!(entry && Date.now() <= entry.expiresAt && entry.nonce === siwe.nonce)
-    }
-  }
-  if (!nonceValid && !pendingNonceValid) return res.status(400).json({ ok: false, error: 'Missing/expired nonce. Please request a new sign-in message.' })
-
-  let verifyResult
-  try {
-    verifyResult = await siwe.verify({
-      signature,
-      domain: expectedDomain,
-      nonce: siwe.nonce,
-      time: new Date().toISOString(),
-    })
-  } catch (err) {
-    console.error('SIWE verify threw:', err)
-    return res.status(401).json({ ok: false, error: 'Invalid SIWE signature' })
-  }
-
-  if (!verifyResult.success) return res.status(401).json({ ok: false, error: 'Invalid SIWE signature' })
-
-  // Balance check (on the chain from the SIWE message)
-  let balanceEth = null
-  const chainId = Number(siwe.chainId)
-  try {
-    const client = getPublicClient(chainId)
-    const balance = await client.getBalance({ address: siwe.address })
-    balanceEth = formatEther(balance)
-  } catch (err) {
-    console.warn('Balance fetch failed', err.message)
-  }
-
-  // Issue Token
-  const token = jwt.sign({ sub: siwe.address.toLowerCase() }, JWT_SECRET, { expiresIn: '7d' })
-  // Detect localhost: cannot use Secure flag over HTTP, and SameSite=None requires Secure
-  const isLocalhost = req.hostname === 'localhost' || req.hostname === '127.0.0.1'
-  const secureCookie = isLocalhost ? false : (isElectron || IS_PROD)
-  const sameSite = isLocalhost ? 'lax' : (isElectron ? 'none' : 'lax')
-  res.cookie('token', token, {
-    httpOnly: true,
-    sameSite,
-    secure: secureCookie,
-    path: '/',
-    maxAge: 7 * 24 * 60 * 60 * 1000,
+ let siwe
+ try {
+  const parsed = new ParsedMessage(message)
+  siwe = new SiweMessage({
+   scheme: parsed.scheme,
+   domain: parsed.domain,
+   address: parsed.address,
+   statement: parsed.statement,
+   uri: parsed.uri,
+   version: parsed.version,
+   chainId: parsed.chainId,
+   nonce: parsed.nonce,
+   issuedAt: parsed.issuedAt,
+   expirationTime: parsed.expirationTime,
+   notBefore: parsed.notBefore,
+   requestId: parsed.requestId,
+   resources: parsed.resources,
   })
+ } catch (err) {
+  console.error('SIWE verify: invalid message format:', err.message)
+  return res.status(400).json({ ok: false, error: 'Invalid SIWE message' })
+ }
 
-  // Automatic Login Logging
-  if (ActivityLog && mongoReady) {
-    try {
-      await ActivityLog.create({
-        type: 'login',
-        address: siwe.address.toLowerCase(),
-        balance: balanceEth,
-        chainId: Number(siwe.chainId),
-        connectorName: 'SIWE',
-        ip: getClientIp(req),
-        userAgent: req.get('user-agent') || 'unknown',
-        timestampLocal: getManilaTime()
-      })
-    } catch (logErr) {
-      console.error('Failed to auto-log login:', logErr.message)
-    }
+ // Standard SIWE field checks 
+ if (siwe.version !== '1') return res.status(400).json({ ok: false, error: 'Invalid SIWE version' })
+ if (siwe.statement !== SIWE_STATEMENT) return res.status(400).json({ ok: false, error: 'Invalid SIWE statement' })
+ if (!isAddress(siwe.address)) return res.status(400).json({ ok: false, error: 'Invalid address' })
+ const verifyChainId = Number(siwe.chainId)
+ const verifyChainIdInt = Number.isFinite(verifyChainId) ? Math.floor(verifyChainId) : 0
+ if (!ALLOWED_CHAIN_IDS.has(verifyChainIdInt)) return res.status(400).json({ ok: false, error: 'Unsupported chainId' })
+
+ // Validate expected frontend origin/domain (must match CORS: 5170-5179 in dev)
+ const isElectron = req.headers['x-electron-app'] === '1'
+ const allowedOrigins = new Set()
+ if (process.env.WEB_ORIGIN) allowedOrigins.add(process.env.WEB_ORIGIN)
+ // Electron desktop app may use a different API origin as the SIWE uri
+ if (process.env.ELECTRON_ORIGIN) allowedOrigins.add(process.env.ELECTRON_ORIGIN)
+ // Accept VITE_API_URL / VITE_API_URL_ELECTRON so the frontend's SIWE uri
+ // is recognised even when WEB_ORIGIN or ELECTRON_ORIGIN aren't set to
+ // the same value (common in same-origin deployments and Electron).
+ if (process.env.VITE_API_URL) allowedOrigins.add(process.env.VITE_API_URL)
+ if (process.env.VITE_API_URL_ELECTRON) allowedOrigins.add(process.env.VITE_API_URL_ELECTRON)
+ if (!IS_PROD) {
+  for (let p = 5170; p <= 5179; p++) {
+   allowedOrigins.add(`http://localhost:${p}`)
+   allowedOrigins.add(`http://127.0.0.1:${p}`)
   }
+  allowedOrigins.add('http://localhost:3000')
+  allowedOrigins.add('http://localhost:3001')
+  // Dev Electron uses the local API server as SIWE uri
+  allowedOrigins.add('http://localhost:3001')
+ }
 
-  return res.json({ ok: true, balance: balanceEth })
+ if (IS_PROD && allowedOrigins.size === 0) {
+  return res.status(503).json({ ok: false, error: 'Server misconfiguration: WEB_ORIGIN required in production' })
+ }
+
+ let msgOrigin
+ try {
+  msgOrigin = new URL(siwe.uri).origin
+ } catch (err) {
+  console.error('SIWE verify: invalid uri in message:', err.message)
+  return res.status(400).json({ ok: false, error: 'Invalid uri in SIWE message' })
+ }
+ if (!allowedOrigins.has(msgOrigin)) {
+  return res.status(400).json({ ok: false, error: `Invalid origin: ${msgOrigin}` })
+ }
+ const expectedDomain = new URL(msgOrigin).host
+ if (siwe.domain !== expectedDomain) {
+  return res.status(400).json({ ok: false, error: 'SIWE domain mismatch' })
+ }
+
+ // Time window checks (prevents old/future messages)
+ const now = Date.now()
+ const issuedAtMs = Date.parse(siwe.issuedAt || '')
+ if (!Number.isFinite(issuedAtMs)) return res.status(400).json({ ok: false, error: 'Invalid issuedAt' })
+ if (issuedAtMs > now + SIWE_CLOCK_SKEW_MS) return res.status(400).json({ ok: false, error: 'issuedAt is in the future' })
+ if (now - issuedAtMs > SIWE_TTL_MS + SIWE_CLOCK_SKEW_MS) return res.status(400).json({ ok: false, error: 'SIWE message too old' })
+
+ const expirationMs = Date.parse(siwe.expirationTime || '')
+ if (!Number.isFinite(expirationMs)) return res.status(400).json({ ok: false, error: 'Missing/invalid expirationTime' })
+ if (now > expirationMs + SIWE_CLOCK_SKEW_MS) return res.status(400).json({ ok: false, error: 'SIWE message expired' })
+
+ if (siwe.notBefore) {
+  const notBeforeMs = Date.parse(siwe.notBefore)
+  if (!Number.isFinite(notBeforeMs)) return res.status(400).json({ ok: false, error: 'Invalid notBefore' })
+  if (now + SIWE_CLOCK_SKEW_MS < notBeforeMs) return res.status(400).json({ ok: false, error: 'SIWE message not active yet' })
+ }
+
+ // Consume nonce BEFORE signature verification (anti-replay).
+ // Trade-off: a bad signature burns the nonce, forcing the user to request a
+ // new SIWE message. This is intentional — it prevents an attacker from
+ // replaying a valid nonce with forged signatures in a retry loop.
+ // Check both address-keyed nonces (from /api/nonce) AND pending nonces (from /api/siwe/nonce used by Reown AppKit)
+ const nonceValid = await takeNonce(siwe.address, siwe.nonce)
+ let pendingNonceValid = false
+ if (!nonceValid) {
+  const pendingKey = PENDING_NONCE_KEY(siwe.nonce)
+  if (redis) {
+   try {
+    const stored = await redis.getdel(pendingKey)
+    pendingNonceValid = stored === siwe.nonce
+   } catch {
+    const entry = pendingNonceMemory.get(pendingKey)
+    pendingNonceMemory.delete(pendingKey)
+    pendingNonceValid = !!(entry && Date.now() <= entry.expiresAt && entry.nonce === siwe.nonce)
+   }
+  } else {
+   const entry = pendingNonceMemory.get(pendingKey)
+   pendingNonceMemory.delete(pendingKey)
+   pendingNonceValid = !!(entry && Date.now() <= entry.expiresAt && entry.nonce === siwe.nonce)
+  }
+ }
+ if (!nonceValid && !pendingNonceValid) return res.status(400).json({ ok: false, error: 'Missing/expired nonce. Please request a new sign-in message.' })
+
+ let verifyResult
+ try {
+  verifyResult = await siwe.verify({
+   signature,
+   domain: expectedDomain,
+   nonce: siwe.nonce,
+   time: new Date().toISOString(),
+  })
+ } catch (err) {
+  console.error('SIWE verify threw:', err)
+  return res.status(401).json({ ok: false, error: 'Invalid SIWE signature' })
+ }
+
+ if (!verifyResult.success) return res.status(401).json({ ok: false, error: 'Invalid SIWE signature' })
+
+ // Balance check (on the chain from the SIWE message)
+ let balanceEth = null
+ const chainId = Number(siwe.chainId)
+ try {
+  const client = getPublicClient(chainId)
+  const balance = await client.getBalance({ address: siwe.address })
+  balanceEth = formatEther(balance)
+ } catch (err) {
+  console.warn('Balance fetch failed', err.message)
+ }
+
+ // Issue Token
+ const token = jwt.sign({ sub: siwe.address.toLowerCase(), chainId }, JWT_SECRET, { expiresIn: '7d' })
+ // Detect localhost: cannot use Secure flag over HTTP, and SameSite=None requires Secure
+ const isLocalhost = req.hostname === 'localhost' || req.hostname === '127.0.0.1'
+ const secureCookie = isLocalhost ? false : (isElectron || IS_PROD)
+ const sameSite = isLocalhost ? 'lax' : (isElectron ? 'none' : 'lax')
+ res.cookie('token', token, {
+  httpOnly: true,
+  sameSite,
+  secure: secureCookie,
+  path: '/',
+  maxAge: 7 * 24 * 60 * 60 * 1000,
+ })
+
+ // Automatic Login Logging
+ if (ActivityLog && mongoReady) {
+  try {
+   await ActivityLog.create({
+    type: 'login',
+    address: siwe.address.toLowerCase(),
+    balance: balanceEth,
+    chainId: Number(siwe.chainId),
+    connectorName: 'SIWE',
+    ip: getClientIp(req),
+    userAgent: req.get('user-agent') || 'unknown',
+    timestampLocal: getManilaTime()
+   })
+  } catch (logErr) {
+   console.error('Failed to auto-log login:', logErr.message)
+  }
+ }
+
+ return res.json({ ok: true, balance: balanceEth })
 })
 
 // 3. UPDATED LOGGING (Using MongoDB)
 // ------------------------------------------------------------------
 app.post('/api/log-activity', requireAuth, async (req, res) => {
-  const { type, address, balance, chainId, connectorName } = req.body ?? {}
-  if (!type) return res.status(400).json({ ok: false, error: 'Missing type' })
-  // Require wallet-based auth so I never accept arbitrary body address (e.g. email-only JWT would have req.user.address = null)
-  const authAddress = req.user?.address ?? null
-  if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required to log activity' })
-  const bodyAddress = address != null && address !== '' ? String(address).trim() : null
-  const resolvedAddress = !bodyAddress || bodyAddress.toLowerCase() === authAddress.toLowerCase() ? authAddress : null
-  if (!resolvedAddress) return res.status(403).json({ ok: false, error: 'Cannot log activity for another address' })
-  if (!isAddress(resolvedAddress)) return res.status(400).json({ ok: false, error: 'Invalid address' })
-  const normalizedType = String(type).trim().toLowerCase()
-  if (!ACTIVITY_TYPES.includes(normalizedType)) {
-    return res.status(400).json({ ok: false, error: 'Invalid type. Use POST /api/transactions for transaction logging.' })
+ const { type, address, balance, chainId, connectorName } = req.body ?? {}
+ if (!type) return res.status(400).json({ ok: false, error: 'Missing type' })
+ // Require wallet-based auth so I never accept arbitrary body address (e.g. email-only JWT would have req.user.address = null)
+ const authAddress = req.user?.address ?? null
+ if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required to log activity' })
+ const bodyAddress = address != null && address !== '' ? String(address).trim() : null
+ const resolvedAddress = !bodyAddress || bodyAddress.toLowerCase() === authAddress.toLowerCase() ? authAddress : null
+ if (!resolvedAddress) return res.status(403).json({ ok: false, error: 'Cannot log activity for another address' })
+ if (!isAddress(resolvedAddress)) return res.status(400).json({ ok: false, error: 'Invalid address' })
+ const normalizedType = String(type).trim().toLowerCase()
+ if (!ACTIVITY_TYPES.includes(normalizedType)) {
+  return res.status(400).json({ ok: false, error: 'Invalid type. Use POST /api/transactions for transaction logging.' })
+ }
+
+ const ip = getClientIp(req)
+ if (process.env.DEBUG_LOG_HEADERS === 'true') {
+  console.log('Forwarded headers:', req.headers['x-forwarded-for'])
+ }
+ const userAgent = req.get('user-agent') || 'unknown'
+
+ const logData = {
+  type: normalizedType,
+  address: resolvedAddress,
+  balance: balance != null && balance !== '' ? String(balance) : null,
+  chainId: chainId != null && Number.isFinite(Number(chainId)) ? Number(chainId) : null,
+  connectorName: connectorName != null && String(connectorName).trim() ? String(connectorName).trim() : null,
+  ip,
+  userAgent,
+ }
+
+ try {
+  // Save to MongoDB if available
+  if (ActivityLog && mongoReady) {
+   try {
+    await ActivityLog.create(logData)
+   } catch (err) {
+    console.error('Failed to write to MongoDB activity log:', err)
+   }
   }
 
-  const ip = getClientIp(req)
-  if (process.env.DEBUG_LOG_HEADERS === 'true') {
-    console.log('Forwarded headers:', req.headers['x-forwarded-for'])
-  }
-  const userAgent = req.get('user-agent') || 'unknown'
+  // File fallback: append to activity.txt when MongoDB is unavailable
+  if (!mongoReady || !ActivityLog) {
+   const now = new Date()
+   const date = now.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: '2-digit' })
+   const time = now.toLocaleTimeString('en-US', { hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+   const statusLabel = normalizedType === 'login' ? 'Logged In' : 'Disconnected'
+   const balanceLine = `Balance:     ${logData.balance != null ? logData.balance + ' ETH' : '—'}\n`
+   const chainIdLine = `Chain ID:    ${logData.chainId != null ? logData.chainId : '—'}\n`
+   const connectorLine = `Connector:    ${logData.connectorName != null ? logData.connectorName : '—'}\n`
 
-  const logData = {
-    type: normalizedType,
-    address: resolvedAddress,
-    balance: balance != null && balance !== '' ? String(balance) : null,
-    chainId: chainId != null && Number.isFinite(Number(chainId)) ? Number(chainId) : null,
-    connectorName: connectorName != null && String(connectorName).trim() ? String(connectorName).trim() : null,
-    ip,
-    userAgent,
-  }
-
-  try {
-    // Save to MongoDB if available
-    if (ActivityLog && mongoReady) {
-      try {
-        await ActivityLog.create(logData)
-      } catch (err) {
-        console.error('Failed to write to MongoDB activity log:', err)
-      }
-    }
-
-    // File fallback: append to activity.txt when MongoDB is unavailable
-    if (!mongoReady || !ActivityLog) {
-      const now = new Date()
-      const date = now.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: '2-digit' })
-      const time = now.toLocaleTimeString('en-US', { hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      const statusLabel = normalizedType === 'login' ? 'Logged In' : 'Disconnected'
-      const balanceLine = `Balance:         ${logData.balance != null ? logData.balance + ' ETH' : '—'}\n`
-      const chainIdLine = `Chain ID:        ${logData.chainId != null ? logData.chainId : '—'}\n`
-      const connectorLine = `Connector:       ${logData.connectorName != null ? logData.connectorName : '—'}\n`
-
-      if (await isLogFileEmpty()) {
-        const header = `${'='.repeat(120)}
+   if (await isLogFileEmpty()) {
+    const header = `${'='.repeat(120)}
 ACTIVITY LOG - Web3 Login System
 ${'='.repeat(120)}
 
 `
-        await appendFile(ACTIVITY_LOG_PATH, header, { mode: 0o600 })
-      }
+    await appendFile(ACTIVITY_LOG_PATH, header, { mode: 0o600 })
+   }
 
-      const entry = `${'─'.repeat(80)}
-Time:           ${date} ${time}
-Status:         ${statusLabel}
+   const entry = `${'─'.repeat(80)}
+Time:      ${date} ${time}
+Status:     ${statusLabel}
 Wallet Address: ${resolvedAddress}
-${balanceLine}${chainIdLine}${connectorLine}IP Address:     ${ip}
-User Agent:     ${userAgent}
+${balanceLine}${chainIdLine}${connectorLine}IP Address:   ${ip}
+User Agent:   ${userAgent}
 `
-      await appendFile(ACTIVITY_LOG_PATH, entry, { mode: 0o600 })
+   await appendFile(ACTIVITY_LOG_PATH, entry, { mode: 0o600 })
 
-      // Log rotation if file size exceeds 5MB
-      try {
-        const stats = await stat(ACTIVITY_LOG_PATH)
-        if (stats.size > 5 * 1024 * 1024) {
-          const rotatedPath = `${ACTIVITY_LOG_PATH}.${Date.now()}`
-          await rename(ACTIVITY_LOG_PATH, rotatedPath)
-          console.log(`Log rotated: ${rotatedPath}`)
-        }
-      } catch (rotateErr) {
-        console.warn('Log rotation check failed:', rotateErr.message)
-      }
+   // Log rotation if file size exceeds 5MB
+   try {
+    const stats = await stat(ACTIVITY_LOG_PATH)
+    if (stats.size > 5 * 1024 * 1024) {
+     const rotatedPath = `${ACTIVITY_LOG_PATH}.${Date.now()}`
+     await rename(ACTIVITY_LOG_PATH, rotatedPath)
+     console.log(`Log rotated: ${rotatedPath}`)
     }
-
-    return res.json({ ok: true })
-  } catch (err) {
-    console.error('Failed to write activity log:', err)
-    return res.status(500).json({ ok: false, error: 'Logging failed' })
+   } catch (rotateErr) {
+    console.warn('Log rotation check failed:', rotateErr.message)
+   }
   }
+
+  return res.json({ ok: true })
+ } catch (err) {
+  console.error('Failed to write activity log:', err)
+  return res.status(500).json({ ok: false, error: 'Logging failed' })
+ }
 })
 
 // GET activity log (from MongoDB or parsed from activity.txt)
 app.get('/api/activity', requireAuth, async (req, res) => {
-  const limit = Math.min(Number(req.query.limit) || 50, 200)
-  const authAddress = req.user?.address ?? null
-  const queryAddress = req.query.address ? String(req.query.address).trim().toLowerCase() : null
-  const filterAddress = queryAddress && authAddress && queryAddress === authAddress.toLowerCase() ? queryAddress : authAddress
-  if (!authAddress) return res.json({ ok: true, activity: [] })
+ const limit = Math.min(Number(req.query.limit) || 50, 200)
+ const authAddress = req.user?.address ?? null
+ const queryAddress = req.query.address ? String(req.query.address).trim().toLowerCase() : null
+ const filterAddress = queryAddress && authAddress && queryAddress === authAddress.toLowerCase() ? queryAddress : authAddress
+ if (!authAddress) return res.json({ ok: true, activity: [] })
 
-  try {
-    if (ActivityLog && mongoReady) {
-      const query = filterAddress
-        ? { address: filterAddress.toLowerCase() }
-        : {}
-      const docs = await ActivityLog.find(query).sort({ timestamp: -1 }).limit(limit).lean()
-      const list = docs.map((d) => ({
-        time: d.timestamp,
-        status: d.type === 'login' ? 'Logged In' : d.type === 'disconnect' ? 'Disconnected' : d.type,
-        address: d.address,
-        balance: d.balance,
-        chainId: d.chainId,
-        connector: d.connectorName,
-      }))
-      return res.json({ ok: true, activity: list })
-    }
-
-    // File fallback: read and parse activity.txt
-    let content
-    try {
-      content = await readFile(ACTIVITY_LOG_PATH, 'utf8')
-    } catch (err) {
-      if (err.code === 'ENOENT') return res.json({ ok: true, activity: [] })
-      throw err
-    }
-    const blocks = content.split(/\n[-─]{20,}\n/).filter((b) => b.trim())
-    const list = []
-    for (const block of blocks) {
-      const entry = {}
-      for (const line of block.split('\n')) {
-        const match = line.match(/^(\S[\w\s]*?):\s+(.*)$/)
-        if (!match) continue
-        const [, key, value] = match
-        if (key === 'Time') entry.time = value
-        else if (key === 'Status') entry.status = value
-        else if (key === 'Wallet Address') entry.address = value
-        else if (key === 'Balance') entry.balance = value === '—' ? null : (value.replace(/\s*ETH$/, '').trim() || null)
-        else if (key === 'Chain ID') entry.chainId = value === '—' ? null : Number(value) || null
-        else if (key === 'Connector') entry.connector = value === '—' ? null : value
-      }
-      if (entry.address && (!filterAddress || entry.address.toLowerCase() === filterAddress)) list.push(entry)
-    }
-    list.reverse()
-    res.json({ ok: true, activity: list.slice(0, limit) })
-  } catch (err) {
-    console.error('Failed to read activity log:', err)
-    return res.status(500).json({ ok: false, error: 'Failed to load activity' })
+ try {
+  if (ActivityLog && mongoReady) {
+   const query = filterAddress
+    ? { address: filterAddress.toLowerCase() }
+    : {}
+   const docs = await ActivityLog.find(query).sort({ timestamp: -1 }).limit(limit).lean()
+   const list = docs.map((d) => ({
+    time: d.timestamp,
+    status: d.type === 'login' ? 'Logged In' : d.type === 'disconnect' ? 'Disconnected' : d.type,
+    address: d.address,
+    balance: d.balance,
+    chainId: d.chainId,
+    connector: d.connectorName,
+   }))
+   return res.json({ ok: true, activity: list })
   }
+
+  // File fallback: read and parse activity.txt
+  let content
+  try {
+   content = await readFile(ACTIVITY_LOG_PATH, 'utf8')
+  } catch (err) {
+   if (err.code === 'ENOENT') return res.json({ ok: true, activity: [] })
+   throw err
+  }
+  const blocks = content.split(/\n[-─]{20,}\n/).filter((b) => b.trim())
+  const list = []
+  for (const block of blocks) {
+   const entry = {}
+   for (const line of block.split('\n')) {
+    const match = line.match(/^(\S[\w\s]*?):\s+(.*)$/)
+    if (!match) continue
+    const [, key, value] = match
+    if (key === 'Time') entry.time = value
+    else if (key === 'Status') entry.status = value
+    else if (key === 'Wallet Address') entry.address = value
+    else if (key === 'Balance') entry.balance = value === '—' ? null : (value.replace(/\s*ETH$/, '').trim() || null)
+    else if (key === 'Chain ID') entry.chainId = value === '—' ? null : Number(value) || null
+    else if (key === 'Connector') entry.connector = value === '—' ? null : value
+   }
+   if (entry.address && (!filterAddress || entry.address.toLowerCase() === filterAddress)) list.push(entry)
+  }
+  list.reverse()
+  res.json({ ok: true, activity: list.slice(0, limit) })
+ } catch (err) {
+  console.error('Failed to read activity log:', err)
+  return res.status(500).json({ ok: false, error: 'Failed to load activity' })
+ }
 })
 // ------------------------------------------------------------------
 
@@ -882,118 +951,118 @@ const TRANSACTION_LOGGING_ERROR = 'Transaction logging requires MongoDB (MONGO_U
 
 // POST /api/transactions — log a transaction
 app.post('/api/transactions', requireAuth, async (req, res) => {
-  const { type, chainId, connectorName, txHash, fromAddress, toAddress, amountEth, blockNumber, kind, tokenAddress, tokenAmount } = req.body ?? {}
+ const { type, chainId, connectorName, txHash, fromAddress, toAddress, amountEth, blockNumber, kind, tokenAddress, tokenAmount } = req.body ?? {}
 
-  // Require wallet-based auth
-  const authAddress = req.user?.address ?? null
-  if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
-  if (!isAddress(authAddress)) return res.status(400).json({ ok: false, error: 'Invalid address' })
+ // Require wallet-based auth
+ const authAddress = req.user?.address ?? null
+ if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
+ if (!isAddress(authAddress)) return res.status(400).json({ ok: false, error: 'Invalid address' })
 
-  // Validate type (case-insensitive match, store as capitalized enum value)
-  const matchedType = TRANSACTION_TYPES.find(t => t.toLowerCase() === String(type).trim().toLowerCase())
-  if (!matchedType) {
-    return res.status(400).json({ ok: false, error: `Invalid type. Must be one of: ${TRANSACTION_TYPES.join(', ')}` })
-  }
+ // Validate type (case-insensitive match, store as capitalized enum value)
+ const matchedType = TRANSACTION_TYPES.find(t => t.toLowerCase() === String(type).trim().toLowerCase())
+ if (!matchedType) {
+  return res.status(400).json({ ok: false, error: `Invalid type. Must be one of: ${TRANSACTION_TYPES.join(', ')}` })
+ }
 
-  // Require MongoDB for this endpoint
-    console.warn(`[server] Transaction log POST requested but MongoDB not ready (mongoReady=${mongoReady})`);
-    return res.status(202).json({ ok: true, warning: 'Transaction logged locally only (DB offline)' })
+ // Require MongoDB for this endpoint
+  console.warn(`[server] Transaction log POST requested but MongoDB not ready (mongoReady=${mongoReady})`);
+  return res.status(202).json({ ok: true, warning: 'Transaction logged locally only (DB offline)' })
 
-  const ip = getClientIp(req)
-  const userAgent = req.get('user-agent') || 'unknown'
+ const ip = getClientIp(req)
+ const userAgent = req.get('user-agent') || 'unknown'
 
-  const chainIdNum = chainId != null && Number.isFinite(Number(chainId)) ? Number(chainId) : 1
-  if (!txHash || !/^0x[a-fA-F0-9]{64}$/.test(String(txHash).trim())) {
-    return res.status(400).json({ ok: false, error: 'Invalid or missing txHash. A valid transaction hash is required.' })
-  }
-  const hash = String(txHash).trim()
+ const chainIdNum = chainId != null && Number.isFinite(Number(chainId)) ? Number(chainId) : 1
+ if (!txHash || !/^0x[a-fA-F0-9]{64}$/.test(String(txHash).trim())) {
+  return res.status(400).json({ ok: false, error: 'Invalid or missing txHash. A valid transaction hash is required.' })
+ }
+ const hash = String(txHash).trim()
 
-  let txData = {
-    type: matchedType,
-    address: authAddress.toLowerCase(),
-    chainId: chainIdNum,
-    connectorName: connectorName != null && String(connectorName).trim() ? String(connectorName).trim().slice(0, 50) : null,
-    txHash: hash,
-    fromAddress: fromAddress && isAddress(String(fromAddress).trim()) ? String(fromAddress).trim() : null,
-    toAddress: toAddress && isAddress(String(toAddress).trim()) ? String(toAddress).trim() : null,
-    amountEth: amountEth != null && amountEth !== '' ? String(amountEth).slice(0, 50) : null,
-    blockNumber: blockNumber != null && Number.isFinite(Number(blockNumber)) ? Number(blockNumber) : null,
-    kind: kind != null && String(kind).trim() ? String(kind).trim().slice(0, 50) : null,
-    tokenAddress: tokenAddress && isAddress(String(tokenAddress).trim()) ? String(tokenAddress).trim() : null,
-    tokenAmount: tokenAmount != null && tokenAmount !== '' ? String(tokenAmount).slice(0, 50) : null,
-    ip,
-    userAgent,
-  }
+ let txData = {
+  type: matchedType,
+  address: authAddress.toLowerCase(),
+  chainId: chainIdNum,
+  connectorName: connectorName != null && String(connectorName).trim() ? String(connectorName).trim().slice(0, 50) : null,
+  txHash: hash,
+  fromAddress: fromAddress && isAddress(String(fromAddress).trim()) ? String(fromAddress).trim() : null,
+  toAddress: toAddress && isAddress(String(toAddress).trim()) ? String(toAddress).trim() : null,
+  amountEth: amountEth != null && amountEth !== '' ? String(amountEth).slice(0, 50) : null,
+  blockNumber: blockNumber != null && Number.isFinite(Number(blockNumber)) ? Number(blockNumber) : null,
+  kind: kind != null && String(kind).trim() ? String(kind).trim().slice(0, 50) : null,
+  tokenAddress: tokenAddress && isAddress(String(tokenAddress).trim()) ? String(tokenAddress).trim() : null,
+  tokenAmount: tokenAmount != null && tokenAmount !== '' ? String(tokenAmount).slice(0, 50) : null,
+  ip,
+  userAgent,
+ }
 
-  // If txHash is provided and missing details, try to fetch from RPC
-  if (hash && (!txData.fromAddress || !txData.toAddress || txData.amountEth == null) && ALLOWED_CHAIN_IDS.has(chainIdNum)) {
-    try {
-      const client = getPublicClient(chainIdNum)
-      const tx = await client.getTransaction({ hash: /** @type {import('viem').Hash} */ (hash) })
-      if (tx) {
-        if (!txData.fromAddress) txData.fromAddress = tx.from
-        if (!txData.toAddress && tx.to) txData.toAddress = tx.to
-        if (txData.amountEth == null && tx.value != null) txData.amountEth = formatEther(tx.value)
-        if (txData.blockNumber == null && tx.blockNumber != null) txData.blockNumber = Number(tx.blockNumber)
-      }
-    } catch (err) {
-      console.warn('Failed to fetch tx details for transaction log:', err.message)
-    }
-  }
-
+ // If txHash is provided and missing details, try to fetch from RPC
+ if (hash && (!txData.fromAddress || !txData.toAddress || txData.amountEth == null) && ALLOWED_CHAIN_IDS.has(chainIdNum)) {
   try {
-    await TransactionLog.create({ ...txData, timestampLocal: getManilaTime() })
-    return res.json({ ok: true })
+   const client = getPublicClient(chainIdNum)
+   const tx = await client.getTransaction({ hash: /** @type {import('viem').Hash} */ (hash) })
+   if (tx) {
+    if (!txData.fromAddress) txData.fromAddress = tx.from
+    if (!txData.toAddress && tx.to) txData.toAddress = tx.to
+    if (txData.amountEth == null && tx.value != null) txData.amountEth = formatEther(tx.value)
+    if (txData.blockNumber == null && tx.blockNumber != null) txData.blockNumber = Number(tx.blockNumber)
+   }
   } catch (err) {
-    console.error('Failed to write transaction log:', err)
-    return res.status(500).json({ ok: false, error: 'Transaction logging failed' })
+   console.warn('Failed to fetch tx details for transaction log:', err.message)
   }
+ }
+
+ try {
+  await TransactionLog.create({ ...txData, timestampLocal: getManilaTime() })
+  return res.json({ ok: true })
+ } catch (err) {
+  console.error('Failed to write transaction log:', err)
+  return res.status(500).json({ ok: false, error: 'Transaction logging failed' })
+ }
 })
 
 // GET /api/transactions — retrieve transaction logs for the authenticated user
 app.get('/api/transactions', requireAuth, async (req, res) => {
-  const authAddress = req.user?.address ?? null
-  if (!authAddress) return res.json({ ok: true, transactions: [] })
+ const authAddress = req.user?.address ?? null
+ if (!authAddress) return res.json({ ok: true, transactions: [] })
 
-  if (!TransactionLog || !mongoReady) {
-    console.warn(`[server] Transactions GET requested but MongoDB not ready (mongoReady=${mongoReady})`);
-    return res.json({ ok: true, transactions: [], warning: 'Database connection inactive' })
+ if (!TransactionLog || !mongoReady) {
+  console.warn(`[server] Transactions GET requested but MongoDB not ready (mongoReady=${mongoReady})`);
+  return res.json({ ok: true, transactions: [], warning: 'Database connection inactive' })
+ }
+
+ const limit = Math.min(Number(req.query.limit) || 50, 200)
+ const typeFilter = req.query.type ? String(req.query.type).trim() : null
+
+ try {
+  const query = { address: authAddress.toLowerCase() }
+  if (typeFilter) {
+   const normalizedType = TRANSACTION_TYPES.find(t => t.toLowerCase() === typeFilter.toLowerCase())
+   if (normalizedType) {
+    query.type = normalizedType
+   }
   }
 
-  const limit = Math.min(Number(req.query.limit) || 50, 200)
-  const typeFilter = req.query.type ? String(req.query.type).trim() : null
-
-  try {
-    const query = { address: authAddress.toLowerCase() }
-    if (typeFilter) {
-      const normalizedType = TRANSACTION_TYPES.find(t => t.toLowerCase() === typeFilter.toLowerCase())
-      if (normalizedType) {
-        query.type = normalizedType
-      }
-    }
-
-    const docs = await TransactionLog.find(query).sort({ timestamp: -1 }).limit(limit).lean()
-    const transactions = docs.map((d) => ({
-      id: d._id,
-      type: d.type,
-      address: d.address,
-      chainId: d.chainId,
-      connectorName: d.connectorName,
-      txHash: d.txHash,
-      fromAddress: d.fromAddress,
-      toAddress: d.toAddress,
-      amountEth: d.amountEth,
-      blockNumber: d.blockNumber,
-      kind: d.kind,
-      tokenAddress: d.tokenAddress,
-      tokenAmount: d.tokenAmount,
-      timestamp: d.timestamp,
-    }))
-    return res.json({ ok: true, transactions })
-  } catch (err) {
-    console.error('Failed to read transaction log:', err)
-    return res.status(500).json({ ok: false, error: 'Failed to load transactions' })
-  }
+  const docs = await TransactionLog.find(query).sort({ timestamp: -1 }).limit(limit).lean()
+  const transactions = docs.map((d) => ({
+   id: d._id,
+   type: d.type,
+   address: d.address,
+   chainId: d.chainId,
+   connectorName: d.connectorName,
+   txHash: d.txHash,
+   fromAddress: d.fromAddress,
+   toAddress: d.toAddress,
+   amountEth: d.amountEth,
+   blockNumber: d.blockNumber,
+   kind: d.kind,
+   tokenAddress: d.tokenAddress,
+   tokenAmount: d.tokenAmount,
+   timestamp: d.timestamp,
+  }))
+  return res.json({ ok: true, transactions })
+ } catch (err) {
+  console.error('Failed to read transaction log:', err)
+  return res.status(500).json({ ok: false, error: 'Failed to load transactions' })
+ }
 })
 // ------------------------------------------------------------------
 
@@ -1003,28 +1072,29 @@ app.get('/api/transactions', requireAuth, async (req, res) => {
 // SECURITY NOTE: The Alchemy API key is kept server-side only.
 // It calls our /api/assets proxy endpoint,
 // which forwards the request to Alchemy. This is the recommended pattern:
-//   Browser → my server (/api/assets) → Alchemy JSON-RPC
+//  Browser → my server (/api/assets) → Alchemy JSON-RPC
 // If you need additional protection, enable Alchemy's "Allowlists" feature
 // to restrict the key to your server's IP or referrer domain.
 // ------------------------------------------------------------------
-const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY ?? null
+// Same root .env often uses VITE_* for Vite; allow either name so one key wires server + dashboard.
+const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY ?? process.env.VITE_ALCHEMY_API_KEY ?? null
 if (!ALCHEMY_API_KEY) {
-  console.warn('[server] ALCHEMY_API_KEY is not set. GET /api/assets will return 503.')
+ console.warn('[server] ALCHEMY_API_KEY (or VITE_ALCHEMY_API_KEY) is not set. GET /api/assets will return 503.')
 }
 
 // Map chainId → Alchemy network slug
 const ALCHEMY_NETWORK = {
-  [mainnet.id]: 'eth-mainnet',
-  [sepolia.id]: 'eth-sepolia',
+ [mainnet.id]: 'eth-mainnet',
+ [sepolia.id]: 'eth-sepolia',
 }
 
 function getAlchemyUrl(chainId) {
-  const network = ALCHEMY_NETWORK[chainId] ?? ALCHEMY_NETWORK[mainnet.id]
-  // Alchemy's JSON-RPC expects the key in the URL path for v2 endpoints.
-  // This is server-side only — the key is never exposed to the browser.
-  // For an extra layer of protection, avoid logging this URL and enable
-  // Alchemy's IP/referrer Allowlists in the dashboard.
-  return `https://${network}.g.alchemy.com/v2/${ALCHEMY_API_KEY}`
+ const network = ALCHEMY_NETWORK[chainId] ?? ALCHEMY_NETWORK[mainnet.id]
+ // Alchemy's JSON-RPC expects the key in the URL path for v2 endpoints.
+ // This is server-side only — the key is never exposed to the browser.
+ // For an extra layer of protection, avoid logging this URL and enable
+ // Alchemy's IP/referrer Allowlists in the dashboard.
+ return `https://${network}.g.alchemy.com/v2/${ALCHEMY_API_KEY}`
 }
 
 // GET /api/assets?address=0x...&chainId=1
@@ -1032,560 +1102,638 @@ function getAlchemyUrl(chainId) {
 // Includes hardcoded fallback for pinned custom tokens (e.g. CSCS) that
 // Alchemy's getTokenBalances may not index automatically.
 const PINNED_TOKEN_ADDRESSES = [
-  '0xa6Ec49E06C25F63292bac1Abc1896451A0f4cFB7', // CSCS (Mainnet)
-  '0x9C9580A8915d2797fb9E9651c93aE1559D8A498e', // CSCR (Mainnet)
+ '0xa6Ec49E06C25F63292bac1Abc1896451A0f4cFB7', // CSCS (Mainnet)
+ '0x9C9580A8915d2797fb9E9651c93aE1559D8A498e', // CSCR (Mainnet)
 ]
 
 const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY ?? null
 const ETHERSCAN_BASE_URL = {
-  [mainnet.id]: 'https://api.etherscan.io/api',
-  [sepolia.id]: 'https://api-sepolia.etherscan.io/api',
+ [mainnet.id]: 'https://api.etherscan.io/api',
+ [sepolia.id]: 'https://api-sepolia.etherscan.io/api',
 }
 
-const MORALIS_API_KEY = process.env.MORALIS_API_KEY ?? null
+const MORALIS_API_KEY = process.env.MORALIS_API_KEY ?? process.env.VITE_MORALIS_API_KEY ?? null
 const MORALIS_BASE_URL = 'https://deep-index.moralis.io/api/v2.2'
 
 if (!ETHERSCAN_API_KEY) console.warn('[server] ETHERSCAN_API_KEY missing')
-if (!MORALIS_API_KEY) console.warn('[server] MORALIS_API_KEY missing')
+if (!MORALIS_API_KEY) console.warn('[server] MORALIS_API_KEY (or VITE_MORALIS_API_KEY) missing')
 
 // --- Helper Functions for Token Discovery ---
 
 async function fetchAlchemyAssets(address, chainId) {
-  if (!ALCHEMY_API_KEY) return [];
-  const alchemyUrl = getAlchemyUrl(chainId);
-  try {
-    const balancesRes = await fetch(alchemyUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'alchemy_getTokenBalances',
-        params: [address, 'erc20'],
-      }),
-    });
-    const balancesJson = await balancesRes.json();
-    const tokenBalances = balancesJson.result?.tokenBalances ?? [];
-    const nonZero = tokenBalances.filter((t) => t.tokenBalance && BigInt(t.tokenBalance) > 0n);
+ if (!ALCHEMY_API_KEY) return [];
+ const alchemyUrl = getAlchemyUrl(chainId);
+ try {
+  const balancesRes = await fetch(alchemyUrl, {
+   method: 'POST',
+   headers: { 'content-type': 'application/json' },
+   body: JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'alchemy_getTokenBalances',
+    params: [address, 'erc20'],
+   }),
+  });
+  const balancesJson = await balancesRes.json();
+  const tokenBalances = balancesJson.result?.tokenBalances ?? [];
+  const nonZero = tokenBalances.filter((t) => t.tokenBalance && BigInt(t.tokenBalance) > 0n);
 
-    // Metadata fetch (batched)
-    if (nonZero.length === 0) return [];
-    const batchBody = nonZero.map((t, i) => ({
-      jsonrpc: '2.0',
-      id: i,
-      method: 'alchemy_getTokenMetadata',
-      params: [t.contractAddress],
-    }));
-    const metaRes = await fetch(alchemyUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(batchBody),
-    });
-    const metaJson = await metaRes.json();
-    const metaArray = Array.isArray(metaJson) ? metaJson : [metaJson];
-    const metaMap = new Map();
-    for (const m of metaArray) {
-      if (m.result) metaMap.set(m.id, m.result);
-    }
-
-    return nonZero.map((t, i) => {
-      const meta = metaMap.get(i) ?? {};
-      const decimals = meta.decimals != null ? meta.decimals : null;
-      return {
-        contractAddress: t.contractAddress,
-        name: meta.name || 'Unknown Token',
-        symbol: meta.symbol || '???',
-        decimals,
-        balance: decimals != null ? formatUnits(BigInt(t.tokenBalance), decimals) : null,
-        logo: meta.logo ?? null,
-        source: 'alchemy'
-      };
-    });
-  } catch (err) {
-    console.error('fetchAlchemyAssets error:', err.message);
-    return [];
+  // Metadata fetch (batched)
+  if (nonZero.length === 0) return [];
+  const batchBody = nonZero.map((t, i) => ({
+   jsonrpc: '2.0',
+   id: i,
+   method: 'alchemy_getTokenMetadata',
+   params: [t.contractAddress],
+  }));
+  const metaRes = await fetch(alchemyUrl, {
+   method: 'POST',
+   headers: { 'content-type': 'application/json' },
+   body: JSON.stringify(batchBody),
+  });
+  const metaJson = await metaRes.json();
+  const metaArray = Array.isArray(metaJson) ? metaJson : [metaJson];
+  const metaMap = new Map();
+  for (const m of metaArray) {
+   if (m.result) metaMap.set(m.id, m.result);
   }
+
+  return nonZero.map((t, i) => {
+   const meta = metaMap.get(i) ?? {};
+   const decimals = meta.decimals != null ? meta.decimals : null;
+   return {
+    contractAddress: t.contractAddress,
+    name: meta.name || 'Unknown Token',
+    symbol: meta.symbol || '???',
+    decimals,
+    balance: decimals != null ? formatUnits(BigInt(t.tokenBalance), decimals) : null,
+    logo: meta.logo ?? null,
+    source: 'alchemy'
+   };
+  });
+ } catch (err) {
+  console.error('fetchAlchemyAssets error:', err.message);
+  return [];
+ }
 }
 
 async function fetchEtherscanAssets(address, chainId) {
-  if (!ETHERSCAN_API_KEY) return [];
-  const etherscanBaseUrl = ETHERSCAN_BASE_URL[chainId] ?? ETHERSCAN_BASE_URL[mainnet.id];
-  try {
-    const tokentxUrl = `${etherscanBaseUrl}?module=account&action=tokentx&address=${encodeURIComponent(address)}&startblock=0&endblock=99999999&sort=desc&apikey=${ETHERSCAN_API_KEY}`;
-    const tokentxRes = await fetch(tokentxUrl);
-    const tokentxJson = await tokentxRes.json();
-    const transfers = Array.isArray(tokentxJson.result) ? tokentxJson.result : [];
-    
-    const tokenMap = new Map();
-    for (const tx of transfers) {
-      const contractAddr = tx.contractAddress?.toLowerCase();
-      if (!contractAddr || tokenMap.has(contractAddr)) continue;
-      tokenMap.set(contractAddr, {
-        contractAddress: tx.contractAddress,
-        name: tx.tokenName || 'Unknown Token',
-        symbol: tx.tokenSymbol || '???',
-        decimals: tx.tokenDecimal != null ? Number(tx.tokenDecimal) : null,
-      });
-    }
-
-    const client = getPublicClient(chainId);
-    const erc20BalanceAbi = [{ inputs: [{ name: 'account', type: 'address' }], name: 'balanceOf', outputs: [{ name: '', type: 'uint256' }], stateMutability: 'view', type: 'function' }];
-    const assets = [];
-    const tokenEntries = Array.from(tokenMap.values());
-    const BATCH_SIZE = 20;
-
-    for (let i = 0; i < tokenEntries.length; i += BATCH_SIZE) {
-      const batch = tokenEntries.slice(i, i + BATCH_SIZE);
-      const results = await Promise.all(batch.map(async (token) => {
-        try {
-          const balance = await client.readContract({
-            address: token.contractAddress,
-            abi: erc20BalanceAbi,
-            functionName: 'balanceOf',
-            args: [address],
-          });
-          return { token, balance: BigInt(balance) };
-        } catch { return { token, balance: 0n }; }
-      }));
-      for (const { token, balance } of results) {
-        if (balance > 0n) {
-          assets.push({
-            contractAddress: token.contractAddress,
-            name: token.name,
-            symbol: token.symbol,
-            decimals: token.decimals,
-            balance: token.decimals != null ? formatUnits(balance, token.decimals) : null,
-            logo: null,
-            source: 'etherscan'
-          });
-        }
-      }
-    }
-    return assets;
-  } catch (err) {
-    console.error('fetchEtherscanAssets error:', err.message);
-    return [];
+ if (!ETHERSCAN_API_KEY) return [];
+ const etherscanBaseUrl = ETHERSCAN_BASE_URL[chainId] ?? ETHERSCAN_BASE_URL[mainnet.id];
+ try {
+  const tokentxUrl = `${etherscanBaseUrl}?module=account&action=tokentx&address=${encodeURIComponent(address)}&startblock=0&endblock=99999999&sort=desc&apikey=${ETHERSCAN_API_KEY}`;
+  const tokentxRes = await fetch(tokentxUrl);
+  const tokentxJson = await tokentxRes.json();
+  const transfers = Array.isArray(tokentxJson.result) ? tokentxJson.result : [];
+  
+  const tokenMap = new Map();
+  for (const tx of transfers) {
+   const contractAddr = tx.contractAddress?.toLowerCase();
+   if (!contractAddr || tokenMap.has(contractAddr)) continue;
+   tokenMap.set(contractAddr, {
+    contractAddress: tx.contractAddress,
+    name: tx.tokenName || 'Unknown Token',
+    symbol: tx.tokenSymbol || '???',
+    decimals: tx.tokenDecimal != null ? Number(tx.tokenDecimal) : null,
+   });
   }
+
+  const client = getPublicClient(chainId);
+  const erc20BalanceAbi = [{ inputs: [{ name: 'account', type: 'address' }], name: 'balanceOf', outputs: [{ name: '', type: 'uint256' }], stateMutability: 'view', type: 'function' }];
+  const assets = [];
+  const tokenEntries = Array.from(tokenMap.values());
+  const BATCH_SIZE = 20;
+
+  for (let i = 0; i < tokenEntries.length; i += BATCH_SIZE) {
+   const batch = tokenEntries.slice(i, i + BATCH_SIZE);
+   const results = await Promise.all(batch.map(async (token) => {
+    try {
+     const balance = await client.readContract({
+      address: token.contractAddress,
+      abi: erc20BalanceAbi,
+      functionName: 'balanceOf',
+      args: [address],
+     });
+     return { token, balance: BigInt(balance) };
+    } catch { return { token, balance: 0n }; }
+   }));
+   for (const { token, balance } of results) {
+    if (balance > 0n) {
+     assets.push({
+      contractAddress: token.contractAddress,
+      name: token.name,
+      symbol: token.symbol,
+      decimals: token.decimals,
+      balance: token.decimals != null ? formatUnits(balance, token.decimals) : null,
+      logo: null,
+      source: 'etherscan'
+     });
+    }
+   }
+  }
+  return assets;
+ } catch (err) {
+  console.error('fetchEtherscanAssets error:', err.message);
+  return [];
+ }
 }
 
 async function fetchMoralisAssets(address, chainId) {
-  if (!MORALIS_API_KEY) return [];
-  const moralisChain = getMoralisChain(chainId);
-  try {
-    const url = `${MORALIS_BASE_URL}/wallets/${address}/tokens?chain=${moralisChain}`;
-    const headers = { 'accept': 'application/json' };
-    if (MORALIS_API_KEY.startsWith('eyJ')) headers['Authorization'] = `Bearer ${MORALIS_API_KEY}`;
-    else headers['X-API-Key'] = MORALIS_API_KEY;
+ if (!MORALIS_API_KEY) return [];
+ const moralisChain = getMoralisChain(chainId);
+ try {
+  const url = `${MORALIS_BASE_URL}/wallets/${address}/tokens?chain=${moralisChain}`;
+  const headers = { 'accept': 'application/json' };
+  if (MORALIS_API_KEY.startsWith('eyJ')) headers['Authorization'] = `Bearer ${MORALIS_API_KEY}`;
+  else headers['X-API-Key'] = MORALIS_API_KEY;
 
-    const response = await fetch(url, { method: 'GET', headers });
-    if (!response.ok) return [];
-    const data = await response.json();
-    const tokens = data.result ?? [];
+  const response = await fetch(url, { method: 'GET', headers });
+  if (!response.ok) return [];
+  const data = await response.json();
+  const tokens = data.result ?? [];
 
-    return tokens.map((token) => ({
-      contractAddress: token.token_address,
-      symbol: token.symbol ?? '???',
-      name: token.name ?? 'Unknown Token',
-      balance: token.balance != null && token.decimals != null ? formatUnits(BigInt(token.balance), token.decimals) : (token.balance ?? '0'),
-      decimals: token.decimals ?? null,
-      logo: token.thumbnail ?? null,
-      source: 'moralis'
-    }));
-  } catch (err) {
-    console.error('fetchMoralisAssets error:', err.message);
-    return [];
-  }
+  return tokens.map((token) => ({
+   contractAddress: token.token_address,
+   symbol: token.symbol ?? '???',
+   name: token.name ?? 'Unknown Token',
+   balance: token.balance != null && token.decimals != null ? formatUnits(BigInt(token.balance), token.decimals) : (token.balance ?? '0'),
+   decimals: token.decimals ?? null,
+   logo: token.thumbnail ?? null,
+   source: 'moralis'
+  }));
+ } catch (err) {
+  console.error('fetchMoralisAssets error:', err.message);
+  return [];
+ }
 }
 
 function getMoralisChain(chainId) {
-  return MORALIS_CHAIN[chainId] ?? MORALIS_CHAIN[mainnet.id];
+ return MORALIS_CHAIN[chainId] ?? MORALIS_CHAIN[mainnet.id];
 }
 
 // ------------------------------------------------------------------
 
 app.get('/api/assets', expensiveReadLimiter, requireAuth, async (req, res) => {
-  const authAddress = req.user?.address ?? null;
-  if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' });
+ const authAddress = req.user?.address ?? null;
+ if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' });
 
-  const queryAddress = req.query.address ? String(req.query.address).trim() : authAddress;
-  if (queryAddress.toLowerCase() !== authAddress.toLowerCase()) return res.status(403).json({ ok: false, error: 'Forbidden' });
-  const chainId = Number(req.query.chainId ?? mainnet.id);
+ const queryAddress = req.query.address ? String(req.query.address).trim() : authAddress;
+ if (queryAddress.toLowerCase() !== authAddress.toLowerCase()) return res.status(403).json({ ok: false, error: 'Forbidden' });
+ const chainId = Number(req.query.chainId ?? mainnet.id);
 
-  const assets = await fetchAlchemyAssets(queryAddress, chainId);
-  
-  // Apply pinned tokens and sorting (shared logic)
-  const pinnedSet = new Set(PINNED_TOKEN_ADDRESSES.map(a => a.toLowerCase()));
-  // (In a real app, we'd also fetch specific balances for pinned tokens if missing)
-  
-  return res.json({ ok: true, assets });
+ const assets = await fetchAlchemyAssets(queryAddress, chainId);
+ 
+ // Apply pinned tokens and sorting (shared logic)
+ const pinnedSet = new Set(PINNED_TOKEN_ADDRESSES.map(a => a.toLowerCase()));
+ // (In a real app, we'd also fetch specific balances for pinned tokens if missing)
+ 
+ return res.json({ ok: true, assets });
 });
 
 app.get('/api/etherscan-assets', requireAuth, async (req, res) => {
-  const authAddress = req.user?.address ?? null;
-  if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' });
+ const authAddress = req.user?.address ?? null;
+ if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' });
 
-  const queryAddress = req.query.address ? String(req.query.address).trim() : authAddress;
-  if (queryAddress.toLowerCase() !== authAddress.toLowerCase()) return res.status(403).json({ ok: false, error: 'Forbidden' });
-  const chainId = Number(req.query.chainId ?? mainnet.id);
+ const queryAddress = req.query.address ? String(req.query.address).trim() : authAddress;
+ if (queryAddress.toLowerCase() !== authAddress.toLowerCase()) return res.status(403).json({ ok: false, error: 'Forbidden' });
+ const chainId = Number(req.query.chainId ?? mainnet.id);
 
-  const assets = await fetchEtherscanAssets(queryAddress, chainId);
-  return res.json({ ok: true, assets });
+ const assets = await fetchEtherscanAssets(queryAddress, chainId);
+ return res.json({ ok: true, assets });
 });
 
 app.get('/api/tokens', requireAuth, async (req, res) => {
-  const authAddress = req.user?.address ?? null;
-  if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' });
+ const authAddress = req.user?.address ?? null;
+ if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' });
 
-  const queryAddress = req.query.address ? String(req.query.address).trim() : authAddress;
-  if (queryAddress.toLowerCase() !== authAddress.toLowerCase()) return res.status(403).json({ ok: false, error: 'Forbidden' });
-  const chainId = Number(req.query.chainId ?? mainnet.id);
+ const queryAddress = req.query.address ? String(req.query.address).trim() : authAddress;
+ if (queryAddress.toLowerCase() !== authAddress.toLowerCase()) return res.status(403).json({ ok: false, error: 'Forbidden' });
+ const chainId = Number(req.query.chainId ?? mainnet.id);
 
-  const assets = await fetchMoralisAssets(queryAddress, chainId);
-  return res.json({ ok: true, tokens: assets }); // Note: legacy response key 'tokens'
+ const assets = await fetchMoralisAssets(queryAddress, chainId);
+ return res.json({ ok: true, tokens: assets }); // Note: legacy response key 'tokens'
 });
 
 // NEW DEEP DISCOVERY ENDPOINT
 app.get('/api/all-assets', expensiveReadLimiter, requireAuth, async (req, res) => {
-  const authAddress = req.user?.address ?? null;
-  if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' });
+ const authAddress = req.user?.address ?? null;
+ if (!authAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' });
 
-  const queryAddress = req.query.address ? String(req.query.address).trim() : authAddress;
-  if (queryAddress.toLowerCase() !== authAddress.toLowerCase()) return res.status(403).json({ ok: false, error: 'Forbidden' });
-  const chainId = Number(req.query.chainId ?? mainnet.id);
+ const queryAddress = req.query.address ? String(req.query.address).trim() : authAddress;
+ if (queryAddress.toLowerCase() !== authAddress.toLowerCase()) return res.status(403).json({ ok: false, error: 'Forbidden' });
+ const chainId = Number(req.query.chainId ?? mainnet.id);
 
-  const cacheKey = `discovery:${chainId}:${queryAddress.toLowerCase()}`;
-  
-  try {
-    // 1. Check Cache
-    const cached = await getCachedData(cacheKey);
-    if (cached) {
-    // console.log(`[Discovery] Cache Hit for ${queryAddress}`);
-      return res.json({ ok: true, assets: JSON.parse(cached), cached: true });
-    }
-
-    const results = await Promise.allSettled([
-      fetchAlchemyAssets(queryAddress, chainId),
-      fetchEtherscanAssets(queryAddress, chainId),
-      fetchMoralisAssets(queryAddress, chainId),
-    ]);
-
-    const allTokens = [];
-    results.forEach((res, i) => {
-      const source = i === 0 ? 'Alchemy' : i === 1 ? 'Etherscan' : 'Moralis';
-      if (res.status === 'fulfilled') {
-      // console.log(`[Discovery] ${source} found ${res.value.length} tokens`);
-        allTokens.push(...res.value);
-      }
-    });
-
-    const mergedMap = new Map();
-    for (const t of allTokens) {
-      const addr = t.contractAddress?.toLowerCase();
-      if (!addr) continue;
-      if (!mergedMap.has(addr)) {
-        mergedMap.set(addr, t);
-      } else {
-        const existing = mergedMap.get(addr);
-        if (!existing.logo && t.logo) existing.logo = t.logo;
-        const oldBal = parseFloat(existing.balance || '0');
-        const newBal = parseFloat(t.balance || '0');
-        if (newBal > oldBal) existing.balance = t.balance;
-      }
-    }
-
-    // Ensure pinned tokens are included
-    for (const pinned of PINNED_TOKEN_ADDRESSES) {
-      const lower = pinned.toLowerCase();
-      if (!mergedMap.has(lower)) {
-        mergedMap.set(lower, {
-          contractAddress: pinned,
-          name: lower === '0xa6ec49e06c25f63292bac1abc1896451a0f4cfb7' ? 'CSCS Token' : 'CSCR Token',
-          symbol: lower === '0xa6ec49e06c25f63292bac1abc1896451a0f4cfb7' ? 'CSCS' : 'CSCR',
-          decimals: 18,
-          balance: '0',
-          logo: null,
-          source: 'pinned'
-        });
-      }
-    }
-
-    const assets = Array.from(mergedMap.values());
-
-    // Sort: pinned first, then alphabetical
-    const pinnedSet = new Set(PINNED_TOKEN_ADDRESSES.map(a => a.toLowerCase()));
-    assets.sort((a, b) => {
-      const aPinned = pinnedSet.has(a.contractAddress?.toLowerCase());
-      const bPinned = pinnedSet.has(b.contractAddress?.toLowerCase());
-      if (aPinned && !bPinned) return -1;
-      if (!aPinned && bPinned) return 1;
-      return (a.symbol || '').localeCompare(b.symbol || '');
-    });
-
-    // 2. Cache Result (30 minute TTL for discovery)
-    await setCachedData(cacheKey, JSON.stringify(assets), 1800);
-
-    return res.json({ ok: true, assets });
-  } catch (err) {
-    console.error('Deep discovery failed:', err);
-    return res.status(500).json({ ok: false, error: 'Deep discovery failed' });
+ const cacheKey = `discovery:${chainId}:${queryAddress.toLowerCase()}`;
+ 
+ try {
+  // 1. Check Cache
+  const cached = await getCachedData(cacheKey);
+  if (cached) {
+  // console.log(`[Discovery] Cache Hit for ${queryAddress}`);
+   return res.json({ ok: true, assets: JSON.parse(cached), cached: true });
   }
+
+  const results = await Promise.allSettled([
+   fetchAlchemyAssets(queryAddress, chainId),
+   fetchEtherscanAssets(queryAddress, chainId),
+   fetchMoralisAssets(queryAddress, chainId),
+  ]);
+
+  const allTokens = [];
+  results.forEach((res, i) => {
+   const source = i === 0 ? 'Alchemy' : i === 1 ? 'Etherscan' : 'Moralis';
+   if (res.status === 'fulfilled') {
+   // console.log(`[Discovery] ${source} found ${res.value.length} tokens`);
+    allTokens.push(...res.value);
+   }
+  });
+
+  const mergedMap = new Map();
+  for (const t of allTokens) {
+   const addr = t.contractAddress?.toLowerCase();
+   if (!addr) continue;
+   if (!mergedMap.has(addr)) {
+    mergedMap.set(addr, t);
+   } else {
+    const existing = mergedMap.get(addr);
+    if (!existing.logo && t.logo) existing.logo = t.logo;
+    const oldBal = parseFloat(existing.balance || '0');
+    const newBal = parseFloat(t.balance || '0');
+    if (newBal > oldBal) existing.balance = t.balance;
+   }
+  }
+
+  // Ensure pinned tokens are included
+  for (const pinned of PINNED_TOKEN_ADDRESSES) {
+   const lower = pinned.toLowerCase();
+   if (!mergedMap.has(lower)) {
+    mergedMap.set(lower, {
+     contractAddress: pinned,
+     name: lower === '0xa6ec49e06c25f63292bac1abc1896451a0f4cfb7' ? 'CSCS Token' : 'CSCR Token',
+     symbol: lower === '0xa6ec49e06c25f63292bac1abc1896451a0f4cfb7' ? 'CSCS' : 'CSCR',
+     decimals: 18,
+     balance: '0',
+     logo: null,
+     source: 'pinned'
+    });
+   }
+  }
+
+  const assets = Array.from(mergedMap.values());
+
+  // Sort: pinned first, then alphabetical
+  const pinnedSet = new Set(PINNED_TOKEN_ADDRESSES.map(a => a.toLowerCase()));
+  assets.sort((a, b) => {
+   const aPinned = pinnedSet.has(a.contractAddress?.toLowerCase());
+   const bPinned = pinnedSet.has(b.contractAddress?.toLowerCase());
+   if (aPinned && !bPinned) return -1;
+   if (!aPinned && bPinned) return 1;
+   return (a.symbol || '').localeCompare(b.symbol || '');
+  });
+
+  // 2. Cache Result (30 minute TTL for discovery)
+  await setCachedData(cacheKey, JSON.stringify(assets), 1800);
+
+  return res.json({ ok: true, assets });
+ } catch (err) {
+  console.error('Deep discovery failed:', err);
+  return res.status(500).json({ ok: false, error: 'Deep discovery failed' });
+ }
 });
 
 const MORALIS_CHAIN = {
-  [mainnet.id]: 'eth',
-  [sepolia.id]: 'sepolia',
+ [mainnet.id]: 'eth',
+ [sepolia.id]: 'sepolia',
 }
 
 async function fetchCoinGeckoPrice(address) {
-  try {
-    const CG_MAP = {
-      '0xa6ec49e06c25f63292bac1abc1896451a0f4cfb7': 'ethereum', // CSCS
-      '0x9c9580a8915d2797fb9e9651c93ae1559d8a498e': 'ethereum', // CSCR
-      '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599': 'wrapped-bitcoin',
-      '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2': 'ethereum',
-      'ethereum': 'ethereum',
-      'bitcoin': 'bitcoin',
-    };
-    const cgId = CG_MAP[address.toLowerCase()] || null;
-    if (!cgId) return null;
+ try {
+  const CG_MAP = {
+   '0xa6ec49e06c25f63292bac1abc1896451a0f4cfb7': 'ethereum', // CSCS
+   '0x9c9580a8915d2797fb9e9651c93ae1559d8a498e': 'ethereum', // CSCR
+   '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599': 'wrapped-bitcoin',
+   '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2': 'ethereum',
+   '0xfff9976782d46cc05630d1f6ebab18b2324d6b14': 'ethereum', // Sepolia WETH -> use ETH spot proxy
+   'ethereum': 'ethereum',
+   'bitcoin': 'bitcoin',
+  };
+  const normalized = String(address || '').toLowerCase();
+  const cgId = CG_MAP[normalized] || null;
+  if (!cgId) return null;
 
-    const cgUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd&include_24hr_change=true`;
-    const res = await fetch(cgUrl);
-    if (!res.ok) return null;
-    const data = await res.json();
+  // Primary: CoinGecko
+  const cgUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd&include_24hr_change=true`;
+  const res = await fetch(cgUrl, { headers: { 'accept': 'application/json' } });
+  if (res.ok) {
+   const data = await res.json();
+   const usd = data?.[cgId]?.usd;
+   const chg = data?.[cgId]?.usd_24h_change;
+   if (usd != null || chg != null) {
     return {
-      usdPrice: data[cgId]?.usd || null,
-      usdPrice24hrPercentChange: data[cgId]?.usd_24h_change || null
+     usdPrice: usd != null ? Number(usd) : null,
+     usdPrice24hrPercentChange: chg != null ? Number(chg) : null,
     };
-  } catch (e) {
-    console.warn('[CoinGecko] Fallback failed:', e.message);
-    return null;
+   }
   }
+
+  // Secondary fallback (spot only): Coinbase public API
+  const symbol = cgId === 'bitcoin' || cgId === 'wrapped-bitcoin' ? 'BTC' : 'ETH';
+  const cb = await fetch(`https://api.coinbase.com/v2/prices/${symbol}-USD/spot`, {
+   headers: { 'accept': 'application/json' },
+  });
+  if (cb.ok) {
+   const data = await cb.json();
+   const amount = data?.data?.amount;
+   const usd = amount != null ? Number(amount) : null;
+   if (usd != null && Number.isFinite(usd)) {
+    return {
+     usdPrice: usd,
+     usdPrice24hrPercentChange: null,
+    };
+   }
+  }
+
+  return null;
+ } catch (e) {
+  console.warn('[Price Fallback] CoinGecko/Coinbase failed:', e.message);
+  return null;
+ }
 }
-
-
 
 // CACHING HELPERS (Redis if available, else in-memory)
 async function getCachedData(key) {
-  if (!redis) return null
-  try {
-    return await redis.get(key)
-  } catch (err) {
-    return null
-  }
+ if (!redis) return null
+ try {
+  return await redis.get(key)
+ } catch (err) {
+  return null
+ }
 }
 async function setCachedData(key, value, ttlSeconds = 300) {
-  if (!redis) return
-  try {
-    await redis.set(key, value, 'EX', ttlSeconds)
-  } catch (err) {
-    // fail silently
-  }
+ if (!redis) return
+ try {
+  await redis.set(key, value, 'EX', ttlSeconds)
+ } catch (err) {
+  // fail silently
+ }
 }
 
 // GET /api/token-price?address=0x...&chainId=1
 app.get('/api/token-price', expensiveReadLimiter, requireAuth, async (req, res) => {
-  const address = (req.query.address || '').trim().toLowerCase()
-  if (!address) return res.status(400).json({ ok: false, error: 'Address required' })
+ const address = (req.query.address || '').trim().toLowerCase()
+ if (!address) return res.status(400).json({ ok: false, error: 'Address required' })
+ 
+ const chainId = Number(req.query.chainId ?? mainnet.id)
+ const cacheKey = `price:${chainId}:${address}`
+ 
+ // Try Cache
+ const cached = await getCachedData(cacheKey)
+ if (cached) return res.json({ ok: true, price: JSON.parse(cached).price, change24h: JSON.parse(cached).change24h, cached: true })
+
+ // Handle special native IDs or common symbols
+ if (address === 'ethereum' || address === 'bitcoin') {
+   const cgData = await fetchCoinGeckoPrice(address);
+   if (cgData && (cgData.usdPrice != null || cgData.usdPrice24hrPercentChange != null)) {
+    await setCachedData(cacheKey, JSON.stringify({ price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange }), 300)
+    return res.json({ ok: true, price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange });
+   }
+   // ETH: CoinGecko down / rate-limited — use Moralis WETH USD as a spot proxy (same idea as pricing wrapped native).
+   if (address === 'ethereum' && MORALIS_API_KEY && ALLOWED_CHAIN_IDS.has(chainId)) {
+    const wethByChain = {
+     [mainnet.id]: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2',
+     [sepolia.id]: '0xfff9976782d46cc05630d1f6ebab18b2324d6b14',
+    }
+    const weth = wethByChain[chainId] ?? wethByChain[mainnet.id]
+    const moralisChain = chainId === sepolia.id ? 'sepolia' : 'eth'
+    try {
+     const mUrl = `${MORALIS_BASE_URL}/erc20/${weth}/price?chain=${moralisChain}`
+     const headers = { accept: 'application/json' }
+     if (MORALIS_API_KEY.startsWith('eyJ')) headers['Authorization'] = `Bearer ${MORALIS_API_KEY}`
+     else headers['X-API-Key'] = MORALIS_API_KEY
+     const mRes = await fetch(mUrl, { headers })
+     if (mRes.ok) {
+      const mJson = await mRes.json()
+      const usd = mJson.usdPrice != null ? Number(mJson.usdPrice) : null
+      const change = mJson.usdPrice24hrPercentChange != null ? Number(mJson.usdPrice24hrPercentChange) : (mJson['24hrPercentChange'] != null ? Number(mJson['24hrPercentChange']) : null)
+      if (usd != null || change != null) {
+       await setCachedData(cacheKey, JSON.stringify({ price: usd, change24h: change }), 300)
+       return res.json({ ok: true, price: usd, change24h: change })
+      }
+     }
+    } catch (e) {
+     console.warn('[token-price] Moralis WETH proxy failed:', e.message)
+    }
+   }
+   // CoinGecko often rate-limits or blocks datacenter IPs; match /api/token-prices + Moralis-fallback behavior (no 502 for "price unknown")
+   await setCachedData(cacheKey, JSON.stringify({ price: null, change24h: null }), 60)
+   return res.json({ ok: true, price: null, change24h: null });
+ }
+
+ if (!isAddress(address)) return res.status(400).json({ ok: false, error: 'Invalid address' })
+ const moralisChain = getMoralisChain(chainId)
+
+ try {
+  const url = `${MORALIS_BASE_URL}/erc20/${address}/price?chain=${moralisChain}`
+  const headers = { 'accept': 'application/json' };
+  if (MORALIS_API_KEY.startsWith('eyJ')) headers['Authorization'] = `Bearer ${MORALIS_API_KEY}`;
+  else headers['X-API-Key'] = MORALIS_API_KEY;
+
+  const response = await fetch(url, { headers });
+  if (!response.ok) {
+   const cgData = await fetchCoinGeckoPrice(address);
+   if (cgData) {
+    await setCachedData(cacheKey, JSON.stringify({ price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange }), 300)
+    return res.json({ ok: true, price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange });
+   }
+   // Cache failure for 1 minute to avoid slamming external APIs during outage/rate-limit
+   await setCachedData(cacheKey, JSON.stringify({ price: null, change24h: null }), 60)
+   return res.json({ ok: true, price: null, change24h: null });
+  }
+  const data = await response.json()
+  const usd = data.usdPrice != null ? Number(data.usdPrice) : null
+  const change = data.usdPrice24hrPercentChange != null ? Number(data.usdPrice24hrPercentChange) : (data['24hrPercentChange'] != null ? Number(data['24hrPercentChange']) : null)
   
-  const chainId = Number(req.query.chainId ?? mainnet.id)
+  // Cache Result
+  await setCachedData(cacheKey, JSON.stringify({ price: usd, change24h: change }), 300)
+  
+  return res.json({ ok: true, price: usd, change24h: change })
+ } catch (err) {
+  console.error('Token price fetch error:', err)
+  return res.status(500).json({ ok: false, error: 'Internal server error' })
+ }
+})
+
+// GET /api/token-prices?addresses=0x1,0x2&chainId=1
+app.get('/api/token-prices', expensiveReadLimiter, requireAuth, async (req, res) => {
+ const raw = req.query.addresses
+ const addresses = Array.isArray(raw) ? raw : (typeof raw === 'string' ? raw.split(',') : [])
+ const cleanAddresses = addresses.map(a => (a || '').trim().toLowerCase()).filter(a => a)
+ if (cleanAddresses.length === 0) return res.status(400).json({ ok: false, error: 'Invalid or missing addresses' })
+
+ const chainId = Number(req.query.chainId ?? mainnet.id)
+ const moralisChain = getMoralisChain(chainId)
+ 
+ // Batch processing with Promise.all for optimization
+ const pricePromises = cleanAddresses.slice(0, 50).map(async (address) => {
   const cacheKey = `price:${chainId}:${address}`
   
-  // Try Cache
+  // 1. Check Cache First
   const cached = await getCachedData(cacheKey)
-  if (cached) return res.json({ ok: true, price: JSON.parse(cached).price, change24h: JSON.parse(cached).change24h, cached: true })
+  if (cached) return { address, data: JSON.parse(cached) }
 
-  // Handle special native IDs or common symbols
-  if (address === 'ethereum' || address === 'bitcoin') {
-     const cgData = await fetchCoinGeckoPrice(address);
-     if (cgData) {
-       await setCachedData(cacheKey, JSON.stringify({ price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange }), 300)
-       return res.json({ ok: true, price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange });
-     }
-     return res.status(502).json({ ok: false, error: 'Price fetch failed' });
-  }
-
-  if (!isAddress(address)) return res.status(400).json({ ok: false, error: 'Invalid address' })
-  const moralisChain = getMoralisChain(chainId)
-
+  // 2. Fetch if not cached
   try {
+   let priceData = null
+   if (address === 'ethereum' || address === 'bitcoin') {
+    const cgData = await fetchCoinGeckoPrice(address);
+    if (cgData) priceData = { price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange };
+    if (address === 'ethereum' && MORALIS_API_KEY && ALLOWED_CHAIN_IDS.has(chainId) && (priceData == null || priceData.price == null)) {
+     const wethByChain = {
+      [mainnet.id]: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2',
+      [sepolia.id]: '0xfff9976782d46cc05630d1f6ebab18b2324d6b14',
+     }
+     const weth = wethByChain[chainId] ?? wethByChain[mainnet.id]
+     const mc = chainId === sepolia.id ? 'sepolia' : 'eth'
+     try {
+      const mUrl = `${MORALIS_BASE_URL}/erc20/${weth}/price?chain=${mc}`
+      const headers = { accept: 'application/json' }
+      if (MORALIS_API_KEY.startsWith('eyJ')) headers['Authorization'] = `Bearer ${MORALIS_API_KEY}`
+      else headers['X-API-Key'] = MORALIS_API_KEY
+      const mRes = await fetch(mUrl, { headers })
+      if (mRes.ok) {
+       const mJson = await mRes.json()
+       const usd = mJson.usdPrice != null ? Number(mJson.usdPrice) : null
+       const change = mJson.usdPrice24hrPercentChange != null ? Number(mJson.usdPrice24hrPercentChange) : (mJson['24hrPercentChange'] != null ? Number(mJson['24hrPercentChange']) : null)
+       if (usd != null || change != null) priceData = { price: usd, change24h: change }
+      }
+     } catch (e) {
+      console.warn('[token-prices] Moralis WETH proxy failed:', e.message)
+     }
+    }
+   } else if (isAddress(address)) {
     const url = `${MORALIS_BASE_URL}/erc20/${address}/price?chain=${moralisChain}`
     const headers = { 'accept': 'application/json' };
     if (MORALIS_API_KEY.startsWith('eyJ')) headers['Authorization'] = `Bearer ${MORALIS_API_KEY}`;
     else headers['X-API-Key'] = MORALIS_API_KEY;
 
-    const response = await fetch(url, { headers });
-    if (!response.ok) {
-      const cgData = await fetchCoinGeckoPrice(address);
-      if (cgData) {
-        await setCachedData(cacheKey, JSON.stringify({ price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange }), 300)
-        return res.json({ ok: true, price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange });
-      }
-      // Cache failure for 1 minute to avoid slamming external APIs during outage/rate-limit
-      await setCachedData(cacheKey, JSON.stringify({ price: null, change24h: null }), 60)
-      return res.json({ ok: true, price: null, change24h: null });
+    const response = await fetch(url, { headers })
+    if (response.ok) {
+     const data = await response.json()
+     const change = data.usdPrice24hrPercentChange != null ? Number(data.usdPrice24hrPercentChange) : (data['24hrPercentChange'] != null ? Number(data['24hrPercentChange']) : null)
+     priceData = {
+      price: data.usdPrice != null ? Number(data.usdPrice) : null,
+      change24h: change,
+     }
+    } else {
+     const cgData = await fetchCoinGeckoPrice(address);
+     if (cgData) priceData = { price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange };
     }
-    const data = await response.json()
-    const usd = data.usdPrice != null ? Number(data.usdPrice) : null
-    const change = data.usdPrice24hrPercentChange != null ? Number(data.usdPrice24hrPercentChange) : (data['24hrPercentChange'] != null ? Number(data['24hrPercentChange']) : null)
-    
-    // Cache Result
-    await setCachedData(cacheKey, JSON.stringify({ price: usd, change24h: change }), 300)
-    
-    return res.json({ ok: true, price: usd, change24h: change })
-  } catch (err) {
-    console.error('Token price fetch error:', err)
-    return res.status(500).json({ ok: false, error: 'Internal server error' })
+   }
+
+   if (priceData) {
+    await setCachedData(cacheKey, JSON.stringify(priceData), 300)
+    return { address, data: priceData }
+   } else {
+    // Cache failure for 1 minute
+    await setCachedData(cacheKey, JSON.stringify({ price: null, change24h: null }), 60)
+   }
+  } catch (e) {
+   console.warn('Token price for', address, e.message)
   }
-})
+  return { address, data: null }
+ })
 
-// GET /api/token-prices?addresses=0x1,0x2&chainId=1
-app.get('/api/token-prices', expensiveReadLimiter, requireAuth, async (req, res) => {
-  const raw = req.query.addresses
-  const addresses = Array.isArray(raw) ? raw : (typeof raw === 'string' ? raw.split(',') : [])
-  const cleanAddresses = addresses.map(a => (a || '').trim().toLowerCase()).filter(a => a)
-  if (cleanAddresses.length === 0) return res.status(400).json({ ok: false, error: 'Invalid or missing addresses' })
+ const resultsArr = await Promise.all(pricePromises)
+ const prices = {}
+ resultsArr.forEach(r => {
+  if (r.data) prices[r.address] = r.data
+ })
 
-  const chainId = Number(req.query.chainId ?? mainnet.id)
-  const moralisChain = getMoralisChain(chainId)
-  
-  // Batch processing with Promise.all for optimization
-  const pricePromises = cleanAddresses.slice(0, 50).map(async (address) => {
-    const cacheKey = `price:${chainId}:${address}`
-    
-    // 1. Check Cache First
-    const cached = await getCachedData(cacheKey)
-    if (cached) return { address, data: JSON.parse(cached) }
-
-    // 2. Fetch if not cached
-    try {
-      let priceData = null
-      if (address === 'ethereum' || address === 'bitcoin') {
-        const cgData = await fetchCoinGeckoPrice(address);
-        if (cgData) priceData = { price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange };
-      } else if (isAddress(address)) {
-        const url = `${MORALIS_BASE_URL}/erc20/${address}/price?chain=${moralisChain}`
-        const headers = { 'accept': 'application/json' };
-        if (MORALIS_API_KEY.startsWith('eyJ')) headers['Authorization'] = `Bearer ${MORALIS_API_KEY}`;
-        else headers['X-API-Key'] = MORALIS_API_KEY;
-
-        const response = await fetch(url, { headers })
-        if (response.ok) {
-          const data = await response.json()
-          const change = data.usdPrice24hrPercentChange != null ? Number(data.usdPrice24hrPercentChange) : (data['24hrPercentChange'] != null ? Number(data['24hrPercentChange']) : null)
-          priceData = {
-            price: data.usdPrice != null ? Number(data.usdPrice) : null,
-            change24h: change,
-          }
-        } else {
-          const cgData = await fetchCoinGeckoPrice(address);
-          if (cgData) priceData = { price: cgData.usdPrice, change24h: cgData.usdPrice24hrPercentChange };
-        }
-      }
-
-      if (priceData) {
-        await setCachedData(cacheKey, JSON.stringify(priceData), 300)
-        return { address, data: priceData }
-      } else {
-        // Cache failure for 1 minute
-        await setCachedData(cacheKey, JSON.stringify({ price: null, change24h: null }), 60)
-      }
-    } catch (e) {
-      console.warn('Token price for', address, e.message)
-    }
-    return { address, data: null }
-  })
-
-  const resultsArr = await Promise.all(pricePromises)
-  const prices = {}
-  resultsArr.forEach(r => {
-    if (r.data) prices[r.address] = r.data
-  })
-
-  return res.json({ ok: true, prices })
+ return res.json({ ok: true, prices })
 })
 
 // ------------------------------------------------------------------
 // 4. SESSION / USER ROUTES (used by frontend buttons)
 // ------------------------------------------------------------------
 app.get('/api/walletAddress', (req, res) => {
-  const token = req.cookies?.token
-  if (!token) return res.status(401).json({ ok: false, error: 'Not logged in' })
-  try {
-    const payload = jwt.verify(token, JWT_SECRET)
-    const isWallet = typeof payload.sub === 'string' && payload.sub.startsWith('0x') && isAddress(payload.sub)
-    return res.json({
-      ok: true,
-      address: isWallet ? payload.sub : null,
-      provider: payload.provider ?? null,
-      email: payload.email ?? null,
-      name: payload.name ?? null,
-    })
-  } catch (err) {
-    console.error('walletAddress: JWT verification failed:', err.message)
-    return res.status(401).json({ ok: false, error: 'Invalid/expired token' })
-  }
+ const token = req.cookies?.token
+ if (!token) return res.status(401).json({ ok: false, error: 'Not logged in' })
+ try {
+  const payload = jwt.verify(token, JWT_SECRET)
+  const isWallet = typeof payload.sub === 'string' && payload.sub.startsWith('0x') && isAddress(payload.sub)
+  return res.json({
+   ok: true,
+   address: isWallet ? payload.sub : null,
+   provider: payload.provider ?? null,
+   email: payload.email ?? null,
+   name: payload.name ?? null,
+   chainId: payload.chainId != null && Number.isFinite(Number(payload.chainId)) ? Number(payload.chainId) : null,
+  })
+ } catch (err) {
+  console.error('walletAddress: JWT verification failed:', err.message)
+  return res.status(401).json({ ok: false, error: 'Invalid/expired token' })
+ }
 })
 
 // GET /api/balance — native ETH balance for the authenticated wallet (used by dashboard)
 app.get('/api/balance', requireAuth, async (req, res) => {
-  const address = req.user?.address ?? null
-  if (!address) return res.status(403).json({ ok: false, error: 'Wallet address required' })
-  const chainId = Number(req.query.chainId ?? mainnet.id)
-  if (!ALLOWED_CHAIN_IDS.has(chainId)) {
-    return res.status(400).json({ ok: false, error: 'Unsupported chainId' })
-  }
-  try {
-    const client = getPublicClient(chainId)
-    const balance = await client.getBalance({ address })
-    const balanceEth = formatEther(balance)
-    return res.json({ ok: true, balance: balanceEth, chainId })
-  } catch (err) {
-    console.error('Balance fetch failed:', err.message)
-    return res.status(500).json({ ok: false, error: 'Failed to fetch balance' })
-  }
+ const address = req.user?.address ?? null
+ if (!address) return res.status(403).json({ ok: false, error: 'Wallet address required' })
+ const chainId = Number(req.query.chainId ?? mainnet.id)
+ if (!ALLOWED_CHAIN_IDS.has(chainId)) {
+  return res.status(400).json({ ok: false, error: 'Unsupported chainId' })
+ }
+ try {
+  const client = getPublicClient(chainId)
+  const balance = await client.getBalance({ address })
+  const balanceEth = formatEther(balance)
+  return res.json({ ok: true, balance: balanceEth, chainId })
+ } catch (err) {
+  console.error('Balance fetch failed:', err.message)
+  return res.status(500).json({ ok: false, error: 'Failed to fetch balance' })
+ }
 })
 
 app.get('/api/private', requireAuth, (req, res) => {
-  res.json({
-    ok: true,
-    address: req.user.address,
-    provider: req.user.provider,
-    email: req.user.email,
-    name: req.user.name,
-    secret: 'This is protected data only visible when logged in.',
-  })
+ res.json({
+  ok: true,
+  address: req.user.address,
+  provider: req.user.provider,
+  email: req.user.email,
+  name: req.user.name,
+  secret: 'This is protected data only visible when logged in.',
+ })
 })
 
 app.post('/api/logout', async (req, res) => {
-  const isElectron = req.headers['x-electron-app'] === '1'
-  const isLocalhost = req.hostname === 'localhost' || req.hostname === '127.0.0.1'
-  const secureCookie = isLocalhost ? false : (isElectron || IS_PROD)
-  const sameSite = isLocalhost ? 'lax' : (isElectron ? 'none' : 'lax')
-  const tok = req.cookies?.token
-  let logAddress = null
-  try { if (tok) { const payload = jwt.verify(tok, JWT_SECRET); logAddress = payload.sub; } } catch(e) {}
+ const isElectron = req.headers['x-electron-app'] === '1'
+ const isLocalhost = req.hostname === 'localhost' || req.hostname === '127.0.0.1'
+ const secureCookie = isLocalhost ? false : (isElectron || IS_PROD)
+ const sameSite = isLocalhost ? 'lax' : (isElectron ? 'none' : 'lax')
+ const tok = req.cookies?.token
+ let logAddress = null
+ try { if (tok) { const payload = jwt.verify(tok, JWT_SECRET); logAddress = payload.sub; } } catch(e) {}
 
-  res.clearCookie('token', {
-    path: '/',
-    sameSite,
-    secure: secureCookie,
-  })
+ res.clearCookie('token', {
+  path: '/',
+  sameSite,
+  secure: secureCookie,
+ })
 
-  // Automatic Logout Logging
-  if (logAddress && ActivityLog && mongoReady) {
-    try {
-      await ActivityLog.create({
-        type: 'disconnect',
-        address: logAddress.toLowerCase(),
-        ip: getClientIp(req),
-        userAgent: req.get('user-agent') || 'unknown',
-        timestampLocal: getManilaTime()
-      })
-    } catch (logErr) {}
-  }
+ // Automatic Logout Logging
+ if (logAddress && ActivityLog && mongoReady) {
+  try {
+   await ActivityLog.create({
+    type: 'disconnect',
+    address: logAddress.toLowerCase(),
+    ip: getClientIp(req),
+    userAgent: req.get('user-agent') || 'unknown',
+    timestampLocal: getManilaTime()
+   })
+  } catch (logErr) {}
+ }
 
-  res.json({ ok: true })
+ res.json({ ok: true })
 })
 
 // USER PROFILE ENDPOINTS
@@ -1593,115 +1741,32 @@ app.post('/api/logout', async (req, res) => {
 // Schema for storing user profiles (optional MongoDB: we'll add if needed)
 let UserProfile = null
 if (process.env.MONGO_URI) {
-  const UserProfileSchema = new mongoose.Schema({
-    address: { type: String, required: true, unique: true, index: true, lowercase: true },
-    displayName: { type: String, default: '' },
-    email: { type: String, default: '' },
-    bio: { type: String, default: '' },
-    avatarUrl: { type: String, default: null },
-    settings: { type: Object, default: {} },
-    updatedAt: { type: Date, default: Date.now },
-    updatedAtLocal: { type: String, default: getManilaTime },
-  })
-  UserProfile = mongoose.models.UserProfile || mongoose.model('UserProfile', UserProfileSchema)
+ const UserProfileSchema = new mongoose.Schema({
+  address: { type: String, required: true, unique: true, index: true, lowercase: true },
+  displayName: { type: String, default: '' },
+  email: { type: String, default: '' },
+  bio: { type: String, default: '' },
+  avatarUrl: { type: String, default: null },
+  settings: { type: Object, default: {} },
+  updatedAt: { type: Date, default: Date.now },
+  updatedAtLocal: { type: String, default: getManilaTime },
+ })
+ UserProfile = mongoose.models.UserProfile || mongoose.model('UserProfile', UserProfileSchema)
 }
 
 // In-memory fallback for profiles (persisted to file when MongoDB is unavailable)
-const PROFILE_STORE_PATH = join(__dirname, 'user-profiles.json')
-let profileMemory = new Map()
-
-async function loadProfilesFromFile() {
-  try {
-    const content = await readFile(PROFILE_STORE_PATH, 'utf8')
-    const data = JSON.parse(content)
-    profileMemory = new Map(Object.entries(data))
-  } catch (err) {
-    if (err.code !== 'ENOENT') {
-      console.error('Failed to load profiles from file:', err.message)
-    }
-    profileMemory = new Map()
-  }
-}
-
-async function saveProfilesToFile() {
-  try {
-    const data = Object.fromEntries(profileMemory)
-    await writeFile(PROFILE_STORE_PATH, JSON.stringify(data, null, 2))
-  } catch (err) {
-    console.error('Failed to save profiles to file:', err.message)
-  }
-}
+const profileStore = createProfileStore({ baseDir: __dirname })
 
 // Initialize profiles on startup
-loadProfilesFromFile().catch(err => console.error('Profile init error:', err))
+profileStore.load().catch(err => console.error('Profile init error:', err))
 
-// POST /api/user/profile — save user profile
-app.post('/api/user/profile', requireAuth, async (req, res) => {
-  const address = req.user?.address ?? null
-  if (!address) return res.status(403).json({ ok: false, error: 'Wallet address required' })
-
-  const { displayName, email, bio, avatarUrl, settings } = req.body ?? {}
-
-  // Fetch existing to merge
-  let existingProfile = {};
-  if (typeof UserProfile !== 'undefined' && mongoReady) {
-    try { existingProfile = await UserProfile.findOne({ address: address.toLowerCase() }).lean() || {}; } catch (e) {}
-  } else {
-    existingProfile = profileMemory.get(address.toLowerCase()) || {};
-  }
-
-  const profileData = {
-    address: address.toLowerCase(),
-    displayName: displayName !== undefined ? String(displayName).trim() : existingProfile.displayName || '',
-    email: email !== undefined ? String(email).trim() : existingProfile.email || '',
-    bio: bio !== undefined ? String(bio).trim() : existingProfile.bio || '',
-    avatarUrl: avatarUrl !== undefined ? (avatarUrl ? String(avatarUrl).trim().slice(0, 5000000) : null) : existingProfile.avatarUrl || null,
-    settings: settings !== undefined ? settings : existingProfile.settings || {},
-    updatedAt: new Date(),
-  }
-
-  try {
-    if (UserProfile && mongoReady) {
-      await UserProfile.findOneAndUpdate(
-        { address: address.toLowerCase() },
-        { ...profileData, updatedAtLocal: getManilaTime() },
-        { upsert: true, returnDocument: 'after' }
-      )
-    } else {
-      profileMemory.set(address.toLowerCase(), profileData)
-      await saveProfilesToFile()
-    }
-    return res.json({ ok: true, profile: profileData })
-  } catch (err) {
-    console.error('Failed to save profile:', err)
-    return res.status(500).json({ ok: false, error: 'Failed to save profile' })
-  }
-})
-
-// GET /api/user/profile — retrieve user profile
-app.get('/api/user/profile', requireAuth, async (req, res) => {
-  const address = req.user?.address ?? null
-  if (!address) return res.status(403).json({ ok: false, error: 'Wallet address required' })
-
-  try {
-    let profile = null
-    if (UserProfile && mongoReady) {
-      profile = await UserProfile.findOne({ address: address.toLowerCase() }).lean()
-    } else {
-      profile = profileMemory.get(address.toLowerCase())
-    }
-
-    if (!profile) {
-      // console.log('No profile found for address:', address)
-      return res.json({ ok: true, profile: null })
-    }
-
-    // console.log('Profile found, sending response')
-    return res.json({ ok: true, profile })
-  } catch (err) {
-    console.error('Failed to retrieve profile:', err)
-    return res.status(500).json({ ok: false, error: 'Failed to retrieve profile' })
-  }
+registerProfileRoutes({
+ app,
+ requireAuth,
+ UserProfile,
+ mongoReady,
+ profileStore,
+ getManilaTime,
 })
 
 
@@ -1710,524 +1775,272 @@ app.get('/api/user/profile', requireAuth, async (req, res) => {
 // ALERT RULES + NOTIFICATIONS (MVP)
 // ------------------------------------------------------------------
 function getAuthContext(req) {
-  const userId = req.user?.sub ?? req.user?.address ?? null
-  const walletAddress = req.user?.address ?? null
-  return { userId, walletAddress }
+ const userId = req.user?.sub ?? req.user?.address ?? null
+ const walletAddress = req.user?.address ?? null
+ return { userId, walletAddress }
 }
 
 function assertAlertsReady(res) {
-  if (!mongoReady || !AlertRule || !Notification || !AlertEvent) {
-    res.status(503).json({ ok: false, error: 'Alerts require MongoDB (MONGO_URI)' })
-    return false
-  }
-  return true
+ if (!mongoReady || !AlertRule || !Notification || !AlertEvent) {
+  res.status(503).json({ ok: false, error: 'Alerts require MongoDB (MONGO_URI)' })
+  return false
+ }
+ return true
 }
 
 function parseAlertRuleInput(body = {}) {
-  const { ruleType, target, condition, cooldownMinutes, isEnabled } = body
-  if (!ALERT_RULE_TYPES.includes(ruleType)) return { error: 'Invalid ruleType' }
-  if (!target || typeof target.assetId !== 'string' || !target.assetId.trim()) return { error: 'Invalid target.assetId' }
-  if (!condition || !ALERT_OPERATORS.includes(condition.operator)) return { error: 'Invalid condition.operator' }
-  if (!Number.isFinite(Number(condition.threshold))) return { error: 'Invalid condition.threshold' }
-  const windowMinutes = condition.windowMinutes != null ? Number(condition.windowMinutes) : null
-  if (windowMinutes != null && (!Number.isFinite(windowMinutes) || windowMinutes <= 0)) return { error: 'Invalid condition.windowMinutes' }
-  const cooldown = cooldownMinutes != null ? Number(cooldownMinutes) : 60
-  if (!Number.isFinite(cooldown) || cooldown <= 0) return { error: 'Invalid cooldownMinutes' }
-  return {
-    value: {
-      ruleType,
-      target: {
-        assetId: target.assetId.trim(),
-        chainId: target.chainId != null ? Number(target.chainId) : 1,
-      },
-      condition: {
-        operator: condition.operator,
-        threshold: Number(condition.threshold),
-        windowMinutes,
-      },
-      cooldownMinutes: cooldown,
-      ...(isEnabled != null ? { isEnabled: Boolean(isEnabled) } : {}),
-    }
+ const { ruleType, target, condition, cooldownMinutes, isEnabled } = body
+ if (!ALERT_RULE_TYPES.includes(ruleType)) return { error: 'Invalid ruleType' }
+ if (!target || typeof target.assetId !== 'string' || !target.assetId.trim()) return { error: 'Invalid target.assetId' }
+ if (!condition || !ALERT_OPERATORS.includes(condition.operator)) return { error: 'Invalid condition.operator' }
+ if (!Number.isFinite(Number(condition.threshold))) return { error: 'Invalid condition.threshold' }
+ const windowMinutes = condition.windowMinutes != null ? Number(condition.windowMinutes) : null
+ if (windowMinutes != null && (!Number.isFinite(windowMinutes) || windowMinutes <= 0)) return { error: 'Invalid condition.windowMinutes' }
+ const cooldown = cooldownMinutes != null ? Number(cooldownMinutes) : 60
+ if (!Number.isFinite(cooldown) || cooldown <= 0) return { error: 'Invalid cooldownMinutes' }
+ return {
+  value: {
+   ruleType,
+   target: {
+    assetId: target.assetId.trim(),
+    chainId: target.chainId != null ? Number(target.chainId) : 1,
+   },
+   condition: {
+    operator: condition.operator,
+    threshold: Number(condition.threshold),
+    windowMinutes,
+   },
+   cooldownMinutes: cooldown,
+   ...(isEnabled != null ? { isEnabled: Boolean(isEnabled) } : {}),
   }
+ }
 }
 
 function mapRule(doc) {
-  if (!doc) return null
-  return {
-    id: String(doc._id),
-    isEnabled: doc.isEnabled,
-    ruleType: doc.ruleType,
-    target: doc.target,
-    condition: doc.condition,
-    cooldownMinutes: doc.cooldownMinutes,
-    lastTriggeredAt: doc.lastTriggeredAt,
-    createdAt: doc.createdAt,
-    updatedAt: doc.updatedAt,
-  }
+ if (!doc) return null
+ return {
+  id: String(doc._id),
+  isEnabled: doc.isEnabled,
+  ruleType: doc.ruleType,
+  target: doc.target,
+  condition: doc.condition,
+  cooldownMinutes: doc.cooldownMinutes,
+  lastTriggeredAt: doc.lastTriggeredAt,
+  createdAt: doc.createdAt,
+  updatedAt: doc.updatedAt,
+ }
 }
 
 function mapNotification(doc) {
-  if (!doc) return null
-  return {
-    id: String(doc._id),
-    type: doc.type,
-    severity: doc.severity,
-    title: doc.title,
-    message: doc.message,
-    status: doc.status,
-    alertRuleId: doc.alertRuleId ? String(doc.alertRuleId) : null,
-    metadata: doc.metadata ?? {},
-    createdAt: doc.createdAt,
-    readAt: doc.readAt ?? null,
-  }
+ if (!doc) return null
+ return {
+  id: String(doc._id),
+  type: doc.type,
+  severity: doc.severity,
+  title: doc.title,
+  message: doc.message,
+  status: doc.status,
+  alertRuleId: doc.alertRuleId ? String(doc.alertRuleId) : null,
+  metadata: doc.metadata ?? {},
+  createdAt: doc.createdAt,
+  readAt: doc.readAt ?? null,
+ }
 }
 
 function encodeCursor(doc) {
-  const payload = { createdAt: doc.createdAt?.toISOString?.() ?? new Date().toISOString(), id: String(doc._id) }
-  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
+ const payload = { createdAt: doc.createdAt?.toISOString?.() ?? new Date().toISOString(), id: String(doc._id) }
+ return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
 }
 
 function decodeCursor(cursor) {
-  try {
-    const raw = Buffer.from(String(cursor), 'base64url').toString('utf8')
-    const parsed = JSON.parse(raw)
-    if (!parsed?.createdAt || !parsed?.id) return null
-    const dt = new Date(parsed.createdAt)
-    if (Number.isNaN(dt.getTime())) return null
-    if (!mongoose.Types.ObjectId.isValid(parsed.id)) return null
-    return { createdAt: dt, id: parsed.id }
-  } catch {
-    return null
-  }
+ try {
+  const raw = Buffer.from(String(cursor), 'base64url').toString('utf8')
+  const parsed = JSON.parse(raw)
+  if (!parsed?.createdAt || !parsed?.id) return null
+  const dt = new Date(parsed.createdAt)
+  if (Number.isNaN(dt.getTime())) return null
+  if (!mongoose.Types.ObjectId.isValid(parsed.id)) return null
+  return { createdAt: dt, id: parsed.id }
+ } catch {
+  return null
+ }
 }
 
 const alertsWorkerState = {
-  lastRunAt: null,
-  lastDurationMs: null,
-  lastSummary: null,
+ lastRunAt: null,
+ lastDurationMs: null,
+ lastSummary: null,
 }
 
 function compareNumeric(operator, value, threshold) {
-  if (operator === 'GT') return value > threshold
-  if (operator === 'LT') return value < threshold
-  return false
+ if (operator === 'GT') return value > threshold
+ if (operator === 'LT') return value < threshold
+ return false
 }
 
 async function fetchCoinPriceUsd(assetId) {
-  const id = String(assetId || '').trim().toLowerCase()
-  if (!id) return null
-  const allowedIds = new Set(['ethereum', 'bitcoin'])
-  if (!allowedIds.has(id)) return null
-  const resp = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}&vs_currencies=usd`)
-  if (!resp.ok) return null
-  const json = await resp.json()
-  const price = json?.[id]?.usd
-  return Number.isFinite(Number(price)) ? Number(price) : null
+ const id = String(assetId || '').trim().toLowerCase()
+ if (!id) return null
+ const allowedIds = new Set(['ethereum', 'bitcoin'])
+ if (!allowedIds.has(id)) return null
+ const resp = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}&vs_currencies=usd`)
+ if (!resp.ok) return null
+ const json = await resp.json()
+ const price = json?.[id]?.usd
+ return Number.isFinite(Number(price)) ? Number(price) : null
 }
 
 async function evaluateRuleSignal(rule) {
-  const threshold = Number(rule.condition?.threshold)
-  const operator = rule.condition?.operator
-  if (!Number.isFinite(threshold) || !ALERT_OPERATORS.includes(operator)) {
-    return { triggered: false, skipped: 'invalid-condition' }
-  }
+ const threshold = Number(rule.condition?.threshold)
+ const operator = rule.condition?.operator
+ if (!Number.isFinite(threshold) || !ALERT_OPERATORS.includes(operator)) {
+  return { triggered: false, skipped: 'invalid-condition' }
+ }
 
-  if (rule.ruleType === 'WALLET_BALANCE_BELOW') {
-    try {
-      const chainId = Number(rule.target?.chainId || 1)
-      const client = getPublicClient(chainId)
-      const balanceWei = await client.getBalance({ address: getAddress(rule.walletAddress) })
-      const balanceEth = Number(formatEther(balanceWei))
-      const triggered = compareNumeric(operator, balanceEth, threshold)
-      return {
-        triggered,
-        severity: triggered ? 'WARNING' : 'INFO',
-        title: `Wallet balance ${operator === 'LT' ? 'below' : 'above'} threshold`,
-        message: `Wallet balance is ${balanceEth.toFixed(6)} ETH (threshold ${operator} ${threshold}).`,
-        metadata: { chainId, assetId: rule.target?.assetId, balanceEth, threshold, operator },
-      }
-    } catch {
-      return { triggered: false, skipped: 'balance-fetch-failed' }
+ if (rule.ruleType === 'WALLET_BALANCE_BELOW') {
+  try {
+   const chainId = Number(rule.target?.chainId || 1)
+   const client = getPublicClient(chainId)
+   const balanceWei = await client.getBalance({ address: getAddress(rule.walletAddress) })
+   const balanceEth = Number(formatEther(balanceWei))
+   const triggered = compareNumeric(operator, balanceEth, threshold)
+   return {
+    triggered,
+    severity: triggered ? 'WARNING' : 'INFO',
+    title: `Wallet balance ${operator === 'LT' ? 'below' : 'above'} threshold`,
+    message: `Wallet balance is ${balanceEth.toFixed(6)} ETH (threshold ${operator} ${threshold}).`,
+    metadata: { chainId, assetId: rule.target?.assetId, balanceEth, threshold, operator },
+   }
+  } catch {
+   return { triggered: false, skipped: 'balance-fetch-failed' }
+  }
+ }
+
+ if (rule.ruleType === 'LARGE_TX_VALUE') {
+  const lookbackMinutes = Number(rule.condition?.windowMinutes) > 0 ? Number(rule.condition.windowMinutes) : 60
+  const since = new Date(Date.now() - lookbackMinutes * 60 * 1000)
+  try {
+   const latest = await TransactionLog.findOne({
+    address: rule.walletAddress.toLowerCase(),
+    timestamp: { $gte: since },
+    amountEth: { $ne: null },
+   }).sort({ timestamp: -1 }).lean()
+   if (!latest) return { triggered: false, skipped: 'no-recent-tx' }
+   const amountEth = Number(latest.amountEth)
+   if (!Number.isFinite(amountEth)) return { triggered: false, skipped: 'invalid-tx-amount' }
+   const triggered = compareNumeric(operator, amountEth, threshold)
+   return {
+    triggered,
+    severity: triggered ? 'CRITICAL' : 'INFO',
+    title: `Large transaction ${operator === 'GT' ? 'above' : 'below'} threshold`,
+    message: `Recent ${latest.type || 'transaction'} amount ${amountEth} ETH (threshold ${operator} ${threshold}).`,
+    metadata: {
+     txHash: latest.txHash || null,
+     type: latest.type || null,
+     amountEth,
+     threshold,
+     operator,
+     chainId: latest.chainId || rule.target?.chainId || 1,
+    },
+   }
+  } catch {
+   return { triggered: false, skipped: 'tx-lookup-failed' }
+  }
+ }
+
+ if (rule.ruleType === 'PRICE_CHANGE_PERCENT') {
+  const windowMinutes = Number(rule.condition?.windowMinutes) > 0 ? Number(rule.condition.windowMinutes) : 60
+  const priceNow = await fetchCoinPriceUsd(rule.target?.assetId)
+  if (!Number.isFinite(priceNow)) return { triggered: false, skipped: 'price-unavailable' }
+
+  const windowMs = windowMinutes * 60 * 1000
+  const now = Date.now()
+  const snapshotBucket = Math.floor(now / windowMs)
+  const snapshotKey = `snapshot:${rule._id}:${snapshotBucket}`
+  await AlertEvent.updateOne(
+   { dedupeKey: snapshotKey },
+   {
+    $setOnInsert: {
+     alertRuleId: rule._id,
+     dedupeKey: snapshotKey,
+     evaluatedAt: new Date(),
+     payload: { kind: 'PRICE_SNAPSHOT', assetId: rule.target?.assetId, priceUsd: priceNow },
     }
+   },
+   { upsert: true }
+  )
+
+  const olderThan = new Date(now - windowMs)
+  const baselineEvent = await AlertEvent.findOne({
+   alertRuleId: rule._id,
+   'payload.kind': 'PRICE_SNAPSHOT',
+   evaluatedAt: { $lte: olderThan },
+  }).sort({ evaluatedAt: -1 }).lean()
+
+  if (!baselineEvent?.payload?.priceUsd) return { triggered: false, skipped: 'no-baseline-yet' }
+  const baseline = Number(baselineEvent.payload.priceUsd)
+  if (!Number.isFinite(baseline) || baseline <= 0) return { triggered: false, skipped: 'invalid-baseline' }
+
+  const changePercent = ((priceNow - baseline) / baseline) * 100
+  const triggered = compareNumeric(operator, changePercent, threshold)
+  return {
+   triggered,
+   severity: triggered ? 'WARNING' : 'INFO',
+   title: `${String(rule.target?.assetId || 'Asset').toUpperCase()} price change alert`,
+   message: `${rule.target?.assetId} changed ${changePercent.toFixed(2)}% over ${windowMinutes}m (threshold ${operator} ${threshold}%).`,
+   metadata: { assetId: rule.target?.assetId, priceNow, baselinePrice: baseline, changePercent, threshold, operator, windowMinutes },
   }
+ }
 
-  if (rule.ruleType === 'LARGE_TX_VALUE') {
-    const lookbackMinutes = Number(rule.condition?.windowMinutes) > 0 ? Number(rule.condition.windowMinutes) : 60
-    const since = new Date(Date.now() - lookbackMinutes * 60 * 1000)
-    try {
-      const latest = await TransactionLog.findOne({
-        address: rule.walletAddress.toLowerCase(),
-        timestamp: { $gte: since },
-        amountEth: { $ne: null },
-      }).sort({ timestamp: -1 }).lean()
-      if (!latest) return { triggered: false, skipped: 'no-recent-tx' }
-      const amountEth = Number(latest.amountEth)
-      if (!Number.isFinite(amountEth)) return { triggered: false, skipped: 'invalid-tx-amount' }
-      const triggered = compareNumeric(operator, amountEth, threshold)
-      return {
-        triggered,
-        severity: triggered ? 'CRITICAL' : 'INFO',
-        title: `Large transaction ${operator === 'GT' ? 'above' : 'below'} threshold`,
-        message: `Recent ${latest.type || 'transaction'} amount ${amountEth} ETH (threshold ${operator} ${threshold}).`,
-        metadata: {
-          txHash: latest.txHash || null,
-          type: latest.type || null,
-          amountEth,
-          threshold,
-          operator,
-          chainId: latest.chainId || rule.target?.chainId || 1,
-        },
-      }
-    } catch {
-      return { triggered: false, skipped: 'tx-lookup-failed' }
-    }
-  }
-
-  if (rule.ruleType === 'PRICE_CHANGE_PERCENT') {
-    const windowMinutes = Number(rule.condition?.windowMinutes) > 0 ? Number(rule.condition.windowMinutes) : 60
-    const priceNow = await fetchCoinPriceUsd(rule.target?.assetId)
-    if (!Number.isFinite(priceNow)) return { triggered: false, skipped: 'price-unavailable' }
-
-    const windowMs = windowMinutes * 60 * 1000
-    const now = Date.now()
-    const snapshotBucket = Math.floor(now / windowMs)
-    const snapshotKey = `snapshot:${rule._id}:${snapshotBucket}`
-    await AlertEvent.updateOne(
-      { dedupeKey: snapshotKey },
-      {
-        $setOnInsert: {
-          alertRuleId: rule._id,
-          dedupeKey: snapshotKey,
-          evaluatedAt: new Date(),
-          payload: { kind: 'PRICE_SNAPSHOT', assetId: rule.target?.assetId, priceUsd: priceNow },
-        }
-      },
-      { upsert: true }
-    )
-
-    const olderThan = new Date(now - windowMs)
-    const baselineEvent = await AlertEvent.findOne({
-      alertRuleId: rule._id,
-      'payload.kind': 'PRICE_SNAPSHOT',
-      evaluatedAt: { $lte: olderThan },
-    }).sort({ evaluatedAt: -1 }).lean()
-
-    if (!baselineEvent?.payload?.priceUsd) return { triggered: false, skipped: 'no-baseline-yet' }
-    const baseline = Number(baselineEvent.payload.priceUsd)
-    if (!Number.isFinite(baseline) || baseline <= 0) return { triggered: false, skipped: 'invalid-baseline' }
-
-    const changePercent = ((priceNow - baseline) / baseline) * 100
-    const triggered = compareNumeric(operator, changePercent, threshold)
-    return {
-      triggered,
-      severity: triggered ? 'WARNING' : 'INFO',
-      title: `${String(rule.target?.assetId || 'Asset').toUpperCase()} price change alert`,
-      message: `${rule.target?.assetId} changed ${changePercent.toFixed(2)}% over ${windowMinutes}m (threshold ${operator} ${threshold}%).`,
-      metadata: { assetId: rule.target?.assetId, priceNow, baselinePrice: baseline, changePercent, threshold, operator, windowMinutes },
-    }
-  }
-
-  return { triggered: false, skipped: 'unsupported-rule-type' }
+ return { triggered: false, skipped: 'unsupported-rule-type' }
 }
 
-app.get('/api/alerts/rules', requireAuth, async (req, res) => {
-  if (!assertAlertsReady(res)) return
-  const { userId, walletAddress } = getAuthContext(req)
-  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
-  try {
-    const rules = await AlertRule.find({ userId, walletAddress: walletAddress.toLowerCase() }).sort({ createdAt: -1 }).lean()
-    return res.json({ ok: true, rules: rules.map(mapRule) })
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: 'Failed to list alert rules' })
-  }
+registerAlertsRoutes({
+ app,
+ requireAuth,
+ assertAlertsReady,
+ getAuthContext,
+ parseAlertRuleInput,
+ mapRule,
+ mapNotification,
+ encodeCursor,
+ decodeCursor,
+ mongoose,
+ NOTIFICATION_STATUSES,
+ AlertRule,
+ Notification,
 })
 
-app.post('/api/alerts/rules', requireAuth, async (req, res) => {
-  if (!assertAlertsReady(res)) return
-  const { userId, walletAddress } = getAuthContext(req)
-  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
-  const validation = parseAlertRuleInput(req.body)
-  if (validation.error) return res.status(400).json({ ok: false, error: validation.error })
-  try {
-    const activeCount = await AlertRule.countDocuments({ userId, walletAddress: walletAddress.toLowerCase(), isEnabled: true })
-    if (activeCount >= 20) return res.status(429).json({ ok: false, error: 'Active alert rule limit reached (20)' })
-    const doc = await AlertRule.create({ userId, walletAddress: walletAddress.toLowerCase(), isEnabled: true, ...validation.value })
-    return res.status(201).json({ ok: true, rule: mapRule(doc.toObject()) })
-  } catch {
-    return res.status(500).json({ ok: false, error: 'Failed to create alert rule' })
-  }
-})
-
-app.patch('/api/alerts/rules/:id', requireAuth, async (req, res) => {
-  if (!assertAlertsReady(res)) return
-  const { userId, walletAddress } = getAuthContext(req)
-  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
-  if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ ok: false, error: 'Rule not found' })
-
-  const updates = {}
-  if (req.body.ruleType || req.body.target || req.body.condition || req.body.cooldownMinutes != null || req.body.isEnabled != null) {
-    const merged = {
-      ruleType: req.body.ruleType,
-      target: req.body.target,
-      condition: req.body.condition,
-      cooldownMinutes: req.body.cooldownMinutes,
-      isEnabled: req.body.isEnabled,
-    }
-    const hasCore = merged.ruleType || merged.target || merged.condition
-    if (hasCore) {
-      const validation = parseAlertRuleInput({
-        ruleType: merged.ruleType,
-        target: merged.target,
-        condition: merged.condition,
-        cooldownMinutes: merged.cooldownMinutes,
-        isEnabled: merged.isEnabled,
-      })
-      if (validation.error) return res.status(400).json({ ok: false, error: validation.error })
-      Object.assign(updates, validation.value)
-    } else {
-      if (merged.cooldownMinutes != null) {
-        const cooldown = Number(merged.cooldownMinutes)
-        if (!Number.isFinite(cooldown) || cooldown <= 0) return res.status(400).json({ ok: false, error: 'Invalid cooldownMinutes' })
-        updates.cooldownMinutes = cooldown
-      }
-      if (merged.isEnabled != null) updates.isEnabled = Boolean(merged.isEnabled)
-    }
-  }
-
-  try {
-    const doc = await AlertRule.findOneAndUpdate(
-      { _id: req.params.id, userId, walletAddress: walletAddress.toLowerCase() },
-      { $set: updates },
-      { new: true }
-    ).lean()
-    if (!doc) return res.status(404).json({ ok: false, error: 'Rule not found' })
-    return res.json({ ok: true, rule: mapRule(doc) })
-  } catch {
-    return res.status(500).json({ ok: false, error: 'Failed to update alert rule' })
-  }
-})
-
-app.post('/api/alerts/rules/:id/toggle', requireAuth, async (req, res) => {
-  if (!assertAlertsReady(res)) return
-  const { userId, walletAddress } = getAuthContext(req)
-  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
-  if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ ok: false, error: 'Rule not found' })
-  const isEnabled = Boolean(req.body?.isEnabled)
-  try {
-    const doc = await AlertRule.findOneAndUpdate(
-      { _id: req.params.id, userId, walletAddress: walletAddress.toLowerCase() },
-      { $set: { isEnabled } },
-      { new: true }
-    ).lean()
-    if (!doc) return res.status(404).json({ ok: false, error: 'Rule not found' })
-    return res.json({ ok: true, rule: mapRule(doc) })
-  } catch {
-    return res.status(500).json({ ok: false, error: 'Failed to toggle alert rule' })
-  }
-})
-
-app.delete('/api/alerts/rules/:id', requireAuth, async (req, res) => {
-  if (!assertAlertsReady(res)) return
-  const { userId, walletAddress } = getAuthContext(req)
-  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
-  if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ ok: false, error: 'Rule not found' })
-  try {
-    const deleted = await AlertRule.findOneAndDelete({ _id: req.params.id, userId, walletAddress: walletAddress.toLowerCase() }).lean()
-    if (!deleted) return res.status(404).json({ ok: false, error: 'Rule not found' })
-    return res.json({ ok: true })
-  } catch {
-    return res.status(500).json({ ok: false, error: 'Failed to delete alert rule' })
-  }
-})
-
-app.get('/api/notifications/unread-count', requireAuth, async (req, res) => {
-  if (!assertAlertsReady(res)) return
-  const { userId, walletAddress } = getAuthContext(req)
-  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
-  try {
-    const count = await Notification.countDocuments({ userId, walletAddress: walletAddress.toLowerCase(), status: 'UNREAD' })
-    return res.json({ ok: true, count })
-  } catch {
-    return res.status(500).json({ ok: false, error: 'Failed to fetch unread count' })
-  }
-})
-
-app.get('/api/notifications', requireAuth, async (req, res) => {
-  if (!assertAlertsReady(res)) return
-  const { userId, walletAddress } = getAuthContext(req)
-  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
-  const status = req.query.status ? String(req.query.status) : null
-  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100)
-  const cursor = req.query.cursor ? decodeCursor(req.query.cursor) : null
-  const query = { userId, walletAddress: walletAddress.toLowerCase() }
-  if (status && NOTIFICATION_STATUSES.includes(status)) query.status = status
-  if (cursor) {
-    query.$or = [
-      { createdAt: { $lt: cursor.createdAt } },
-      { createdAt: cursor.createdAt, _id: { $lt: new mongoose.Types.ObjectId(cursor.id) } },
-    ]
-  }
-  try {
-    const docs = await Notification.find(query).sort({ createdAt: -1, _id: -1 }).limit(limit).lean()
-    const nextCursor = docs.length === limit ? encodeCursor(docs[docs.length - 1]) : null
-    return res.json({ ok: true, items: docs.map(mapNotification), nextCursor })
-  } catch {
-    return res.status(500).json({ ok: false, error: 'Failed to list notifications' })
-  }
-})
-
-app.post('/api/notifications/:id/read', requireAuth, async (req, res) => {
-  if (!assertAlertsReady(res)) return
-  const { userId, walletAddress } = getAuthContext(req)
-  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
-  if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ ok: false, error: 'Notification not found' })
-  try {
-    const doc = await Notification.findOneAndUpdate(
-      { _id: req.params.id, userId, walletAddress: walletAddress.toLowerCase() },
-      { $set: { status: 'READ', readAt: new Date() } },
-      { new: true }
-    ).lean()
-    if (!doc) return res.status(404).json({ ok: false, error: 'Notification not found' })
-    return res.json({ ok: true, item: mapNotification(doc) })
-  } catch {
-    return res.status(500).json({ ok: false, error: 'Failed to mark notification read' })
-  }
-})
-
-app.post('/api/notifications/read-all', requireAuth, async (req, res) => {
-  if (!assertAlertsReady(res)) return
-  const { userId, walletAddress } = getAuthContext(req)
-  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
-  try {
-    const result = await Notification.updateMany(
-      { userId, walletAddress: walletAddress.toLowerCase(), status: 'UNREAD' },
-      { $set: { status: 'READ', readAt: new Date() } }
-    )
-    return res.json({ ok: true, updated: result.modifiedCount ?? 0 })
-  } catch {
-    return res.status(500).json({ ok: false, error: 'Failed to mark all notifications read' })
-  }
-})
-
-app.post('/api/notifications/:id/archive', requireAuth, async (req, res) => {
-  if (!assertAlertsReady(res)) return
-  const { userId, walletAddress } = getAuthContext(req)
-  if (!userId || !walletAddress) return res.status(403).json({ ok: false, error: 'Wallet address required' })
-  if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ ok: false, error: 'Notification not found' })
-  try {
-    const doc = await Notification.findOneAndUpdate(
-      { _id: req.params.id, userId, walletAddress: walletAddress.toLowerCase() },
-      { $set: { status: 'ARCHIVED' } },
-      { new: true }
-    ).lean()
-    if (!doc) return res.status(404).json({ ok: false, error: 'Notification not found' })
-    return res.json({ ok: true, item: mapNotification(doc) })
-  } catch {
-    return res.status(500).json({ ok: false, error: 'Failed to archive notification' })
-  }
-})
-
-app.post('/internal/alerts/evaluate-now', async (req, res) => {
-  const key = req.get('x-internal-key')
-  if (!process.env.ALERTS_INTERNAL_KEY || key !== process.env.ALERTS_INTERNAL_KEY) {
-    return res.status(401).json({ ok: false, error: 'Unauthorized' })
-  }
-  if (!assertAlertsReady(res)) return
-
-  const startedAt = Date.now()
-  let evaluatedRules = 0
-  let triggered = 0
-  let createdNotifications = 0
-
-  try {
-    const rules = await AlertRule.find({ isEnabled: true }).lean()
-    evaluatedRules = rules.length
-
-    for (const rule of rules) {
-      const now = Date.now()
-      const cooldownMs = Math.max(Number(rule.cooldownMinutes || 60), 1) * 60 * 1000
-      const lastTriggeredAt = rule.lastTriggeredAt ? new Date(rule.lastTriggeredAt).getTime() : null
-      if (lastTriggeredAt && now - lastTriggeredAt < cooldownMs) continue
-
-      const signal = await evaluateRuleSignal(rule)
-      if (!signal?.triggered) continue
-      triggered += 1
-
-      const timeBucket = Math.floor(now / cooldownMs)
-      const dedupeKey = `trigger:${rule._id}:${timeBucket}`
-      const existing = await AlertEvent.findOne({ dedupeKey }).lean()
-      if (existing) continue
-
-      await AlertEvent.create({
-        alertRuleId: rule._id,
-        dedupeKey,
-        evaluatedAt: new Date(),
-        payload: {
-          kind: 'ALERT_TRIGGER',
-          ruleType: rule.ruleType,
-          metadata: signal.metadata ?? {},
-        },
-      })
-
-      await Notification.create({
-        userId: rule.userId,
-        walletAddress: rule.walletAddress,
-        alertRuleId: rule._id,
-        type: 'ALERT_TRIGGERED',
-        severity: signal.severity || 'WARNING',
-        title: signal.title || 'Alert triggered',
-        message: signal.message || 'Your alert rule was triggered.',
-        metadata: signal.metadata ?? {},
-        status: 'UNREAD',
-      })
-
-      await AlertRule.updateOne({ _id: rule._id }, { $set: { lastTriggeredAt: new Date() } })
-      createdNotifications += 1
-    }
-
-    const durationMs = Date.now() - startedAt
-    alertsWorkerState.lastRunAt = new Date().toISOString()
-    alertsWorkerState.lastDurationMs = durationMs
-    alertsWorkerState.lastSummary = { evaluatedRules, triggered, createdNotifications }
-
-    return res.json({ ok: true, evaluatedRules, triggered, createdNotifications, durationMs })
-  } catch (err) {
-    const durationMs = Date.now() - startedAt
-    alertsWorkerState.lastRunAt = new Date().toISOString()
-    alertsWorkerState.lastDurationMs = durationMs
-    alertsWorkerState.lastSummary = { evaluatedRules, triggered, createdNotifications, error: err?.message || 'unknown' }
-    return res.status(500).json({ ok: false, error: 'Failed to evaluate alerts' })
-  }
-})
-
-app.get('/internal/alerts/health', (_req, res) => {
-  return res.json({
-    ok: true,
-    worker: 'healthy',
-    lastRunAt: alertsWorkerState.lastRunAt,
-    lastDurationMs: alertsWorkerState.lastDurationMs,
-    lastSummary: alertsWorkerState.lastSummary,
-  })
+registerInternalRoutes({
+ app,
+ verifyInternalRequest,
+ assertAlertsReady,
+ AlertRule,
+ AlertEvent,
+ Notification,
+ evaluateRuleSignal,
+ alertsWorkerState,
+ isProd: IS_PROD,
 })
 
 const port = Number(process.env.PORT ?? 3002)
 
 // Start server immediately; MongoDB connects in background so file fallback works without blocking startup
 if (process.env.MONGO_URI) {
-  console.log(`[server] Connecting to MongoDB... (URI length: ${process.env.MONGO_URI.length})`)
-  mongoose.connect(process.env.MONGO_URI, {
-    serverSelectionTimeoutMS: 5000,
-  }).then(() => {
-    mongoReady = true
-    console.log('[server] ✅ Connected to MongoDB')
-  }).catch((err) => {
-    mongoReady = false
-    console.error('[server] ❌ MongoDB connection error:', err.message)
-    if (err.message.includes('authentication failed')) {
-      console.error('[server] Hint: Check your username/password in .env. Ensure no special characters are unescaped.')
-    }
-  })
+ console.log(`[server] Connecting to MongoDB... (URI length: ${process.env.MONGO_URI.length})`)
+ mongoose.connect(process.env.MONGO_URI, {
+  serverSelectionTimeoutMS: 5000,
+ }).then(() => {
+  mongoReady = true
+  console.log('[server] [OK] Connected to MongoDB')
+ }).catch((err) => {
+  mongoReady = false
+  console.error('[server] [ERROR] MongoDB connection error:', err.message)
+  if (err.message.includes('authentication failed')) {
+   console.error('[server] Hint: Check your username/password in .env. Ensure no special characters are unescaped.')
+  }
+ })
 }
 app.listen(port, () => {
-  console.log(`Auth API listening on http://127.0.0.1:${port}`)
+ console.log(`Auth API listening on http://127.0.0.1:${port}`)
 })
