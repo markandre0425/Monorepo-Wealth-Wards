@@ -49,15 +49,6 @@ async function stopAll() {
   }
 }
 
-function isPortOpen(port, host = '127.0.0.1') {
-  return new Promise((resolve) => {
-    const socket = net.createConnection({ host, port });
-    socket.on('connect', () => { socket.destroy(); resolve(true); });
-    socket.on('error', () => resolve(false));
-    socket.setTimeout(700, () => { socket.destroy(); resolve(false); });
-  });
-}
-
 function isPortFree(port, host = '127.0.0.1') {
   return new Promise((resolve) => {
     const server = net.createServer();
@@ -105,7 +96,10 @@ async function main() {
   const backendReady = await waitForHttp(`http://localhost:${backendPort}/api/siwe/nonce`, 200, 1800);
   if (!backendReady) {
     log(`Backend not detected on :${backendPort}, starting apps/server...`);
-    start('backend', 'npm', ['-w', 'apps/server', 'run', 'start'], process.env);
+    start('backend', 'node', ['apps/server/server.js'], {
+      ...process.env,
+      PORT: String(backendPort),
+    });
     const up = await waitForHttp(`http://localhost:${backendPort}/api/siwe/nonce`, 200, 30000);
     assert(up, `Backend failed to start on :${backendPort}`);
   } else {

@@ -1,28 +1,18 @@
 /**
- * Multi-provider blockchain API service with fallback logic
- * Primary: Moralis
- * Secondary: Alchemy
- * Tertiary: Etherscan
- * Price: Backend (Moralis server-side) first, CoinGecko fallback
+ * Dashboard blockchain data service.
+ *
+ * Server-first design:
+ * - Uses backend API endpoints for prices/balance data
+ * - Avoids direct browser calls to Moralis/Alchemy/Etherscan with API keys
  */
 
-// Backend API base — same-origin by default (Vite proxy in dev, same host in prod).
-// Set VITE_API_URL_WEB in production to point to the deployed API.
-import scaffoldConfig from "../scaffold.config";
+import { getApiBase } from './wagmi-api';
 
-// Backend API base — same-origin by default (Vite proxy in dev, same host in prod).
-// Set VITE_API_URL_WEB in production to point to the deployed API.
-const API_BASE = (import.meta.env.VITE_API_URL_WEB as string) || (import.meta.env.VITE_API_URL as string) || '';
-
-// Known token id -> mainnet contract address (for backend /api/token-price which uses contract address)
+// Known token id -> mainnet contract address (backend price endpoint expects token address)
 const TOKEN_ID_TO_ADDRESS: Record<string, string> = {
-  ethereum: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', // WETH
-  bitcoin: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599', // WBTC
+  ethereum: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+  bitcoin: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599',
 };
-
-const MORALIS_API_KEY = import.meta.env.VITE_MORALIS_API_KEY;
-const ALCHEMY_API_KEY = scaffoldConfig.alchemyApiKey;
-const ETHERSCAN_API_KEY = import.meta.env.VITE_ETHERSCAN_API_KEY;
 
 interface TokenData {
   symbol: string;
@@ -40,254 +30,162 @@ interface BalanceData {
   balanceUSD?: number;
 }
 
-// MORALIS API
-async function getMoralisTokenData(contractAddress: string): Promise<TokenData | null> {
+async function fetchBackendJson<T>(path: string): Promise<T | null> {
+  const base = getApiBase();
+  if (!base) return null;
   try {
-    if (!MORALIS_API_KEY) return null;
-
-    const response = await fetch(
-      `https://deep-index.moralis.io/api/v2.2/erc20/${contractAddress}/metadata?chain=eth`,
-      {
-        headers: {
-          'Accept': 'application/json',
-          'X-API-Key': MORALIS_API_KEY,
-        },
-      }
-    );
-
+    const response = await fetch(`${base}${path}`, { credentials: 'include' });
     if (!response.ok) return null;
-
-    const data = await response.json();
-    return {
-      symbol: data.symbol || '',
-      name: data.name || '',
-      contractAddress: data.address,
-    };
+    return (await response.json()) as T;
   } catch {
     return null;
   }
 }
 
-async function getMoralisBalance(address: string): Promise<BalanceData | null> {
+// Legacy helper kept for compatibility with hooks.
+// Uses backend price endpoint only (no client-side provider keys).
+export async function getTokenData(contractAddress: string, chainId = 1): Promise<TokenData> {
+  const normalized = (contractAddress || '').toLowerCase();
+  const data = await fetchBackendJson<{ ok: boolean; prices?: Record<string, { price?: number; change24h?: number }> }>(
+    `/api/token-prices?addresses=${encodeURIComponent(normalized)}&chainId=${chainId}`,
+  );
+
+  const point = data?.ok ? data.prices?.[normalized] : undefined;
+  return {
+    symbol: normalized ? normalized.slice(2, 6).toUpperCase() : 'TOKEN',
+    name: 'Token',
+    contractAddress,
+    price: point?.price,
+    priceChange24h: point?.change24h,
+  };
+}
+
+// Legacy helper kept for compatibility with hooks.
+// Reads authenticated wallet balance from backend (/api/balance).
+export async function getBalance(address: string, chainId = 1): Promise<BalanceData> {
+  const data = await fetchBackendJson<{ ok: boolean; balance?: string }>(`/api/balance?chainId=${chainId}`);
+  return {
+    address,
+    balance: data?.ok && data.balance != null ? String(data.balance) : '0',
+  };
+}
+
+async function getBackendTokenPrice(asset: string, chainId = 1): Promise<{ price?: number; change24h?: number } | null> {
+  const data = await fetchBackendJson<{ ok: boolean; price?: number | null; change24h?: number | null }>(
+    `/api/token-price?address=${encodeURIComponent(asset)}&chainId=${chainId}`,
+  );
+  if (!data?.ok) return null;
+  const price =
+    data.price != null && Number.isFinite(Number(data.price)) ? Number(data.price) : undefined;
+  const change24h =
+    data.change24h != null && Number.isFinite(Number(data.change24h)) ? Number(data.change24h) : undefined;
+  return { price, change24h };
+}
+
+function hasPositiveFiniteSpot(r: { price?: number } | null | undefined): boolean {
+  const spotPrice = r?.price;
+  return spotPrice != null && Number.isFinite(spotPrice) && spotPrice > 0;
+}
+
+/** Same server, different handler — portfolio logs showed token-price empty while token-prices had ETH. */
+async function getNativeSpotFromTokenPrices(
+  asset: 'ethereum' | 'bitcoin',
+  chainId: number,
+): Promise<{ price?: number; change24h?: number } | null> {
+  const data = await fetchBackendJson<{ ok: boolean; prices?: Record<string, { price?: number; change24h?: number }> }>(
+    `/api/token-prices?addresses=${encodeURIComponent(asset)}&chainId=${chainId}`,
+  );
+  const pt = data?.ok ? data.prices?.[asset] : undefined;
+  if (!pt) return null;
+  const price = pt.price != null && Number.isFinite(Number(pt.price)) ? Number(pt.price) : undefined;
+  const change24h =
+    pt.change24h != null && Number.isFinite(Number(pt.change24h)) ? Number(pt.change24h) : undefined;
+  return { price, change24h };
+}
+
+const LLAMA_COIN_KEY: Record<'ethereum' | 'bitcoin', string> = {
+  ethereum: 'coingecko:ethereum',
+  bitcoin: 'coingecko:bitcoin',
+};
+
+/** Browser-safe when our server has no quotes (CORS * on coins.llama.fi). Display / estimate only. */
+async function getNativeSpotFromLlama(asset: 'ethereum' | 'bitcoin'): Promise<{ price?: number } | null> {
+  const coin = LLAMA_COIN_KEY[asset];
   try {
-    if (!MORALIS_API_KEY) return null;
-
-    const response = await fetch(
-      `https://deep-index.moralis.io/api/v2.2/${address}/balance?chain=eth`,
-      {
-        headers: {
-          'Accept': 'application/json',
-          'X-API-Key': MORALIS_API_KEY,
-        },
-      }
-    );
-
-    if (!response.ok) return null;
-
-    const data = await response.json();
-    return {
-      address,
-      balance: data.balance || '0',
-    };
+    const res = await fetch(`https://coins.llama.fi/prices/current/${encodeURIComponent(coin)}`);
+    if (!res.ok) return null;
+    const llamaResponse = (await res.json()) as { coins?: Record<string, { price?: number }> };
+    const rawCoinPrice = llamaResponse?.coins?.[coin]?.price;
+    const price = rawCoinPrice != null && Number.isFinite(Number(rawCoinPrice)) ? Number(rawCoinPrice) : undefined;
+    return price != null && price > 0 ? { price } : null;
   } catch {
     return null;
   }
 }
 
-// ALCHEMY API
-async function getAlchemyTokenData(contractAddress: string): Promise<TokenData | null> {
-  try {
-    if (!ALCHEMY_API_KEY) return null;
+export async function getTokenPrice(tokenId: string = 'ethereum', chainId = 1): Promise<{ price?: number; change24h?: number }> {
+  const normalized = tokenId.toLowerCase();
+  const requestAsset = normalized === 'ethereum' || normalized === 'bitcoin'
+    ? normalized
+    : (TOKEN_ID_TO_ADDRESS[normalized] || (tokenId.startsWith('0x') ? tokenId : null));
 
-    const response = await fetch(
-      `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          method: 'alchemy_getTokenMetadata',
-          params: [contractAddress],
-          id: 1,
-        }),
-      }
-    );
+  if (!requestAsset) return {};
+  const fromSingle = (await getBackendTokenPrice(requestAsset, chainId)) ?? {};
 
-    if (!response.ok) return null;
-
-    const data = await response.json();
-    if (data.result) {
+  if (
+    (requestAsset === 'ethereum' || requestAsset === 'bitcoin') &&
+    !hasPositiveFiniteSpot(fromSingle)
+  ) {
+    const fromBatch = await getNativeSpotFromTokenPrices(requestAsset, chainId);
+    if (hasPositiveFiniteSpot(fromBatch)) {
       return {
-        symbol: data.result.symbol || '',
-        name: data.result.name || '',
-        contractAddress: contractAddress,
+        price: fromBatch!.price,
+        change24h: fromBatch!.change24h ?? fromSingle.change24h,
       };
     }
-    return null;
-  } catch {
-    return null;
-  }
-}
 
-async function getAlchemyBalance(address: string): Promise<BalanceData | null> {
-  try {
-    if (!ALCHEMY_API_KEY) return null;
-
-    const response = await fetch(
-      `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          method: 'eth_getBalance',
-          params: [address, 'latest'],
-          id: 1,
-        }),
-      }
-    );
-
-    if (!response.ok) return null;
-
-    const data = await response.json();
-    if (data.result) {
+    const fromLlama = await getNativeSpotFromLlama(requestAsset);
+    if (hasPositiveFiniteSpot(fromLlama)) {
       return {
-        address,
-        balance: data.result,
+        price: fromLlama!.price,
+        change24h: fromSingle.change24h,
       };
     }
-    return null;
-  } catch {
-    return null;
   }
+
+  return fromSingle;
 }
 
-// ETHERSCAN API
-async function getEtherscanTokenData(contractAddress: string): Promise<TokenData | null> {
-  try {
-    if (!ETHERSCAN_API_KEY) return null;
+export async function getMultipleTokenPrices(tokenIds: string[], chainId = 1): Promise<Record<string, { price?: number; change24h?: number }>> {
+  if (!tokenIds?.length) return {};
 
-    const response = await fetch(
-      `https://api.etherscan.io/api?module=token&action=tokeninfo&contractaddress=${contractAddress}&apikey=${ETHERSCAN_API_KEY}`
-    );
+  const requestKeys = tokenIds
+    .map((id) => {
+      const normalized = id.toLowerCase();
+      if (normalized === 'ethereum' || normalized === 'bitcoin') return normalized;
+      return TOKEN_ID_TO_ADDRESS[normalized] || (id.startsWith('0x') ? id.toLowerCase() : null);
+    })
+    .filter(Boolean) as string[];
 
-    if (!response.ok) return null;
+  if (!requestKeys.length) return {};
 
-    const data = await response.json();
-    if (data.status === '1' && data.result) {
-      return {
-        symbol: data.result[0].symbol || '',
-        name: data.result[0].name || '',
-        contractAddress: contractAddress,
-      };
-    }
-    return null;
-  } catch (error) {
-    return null;
-  }
-}
+  const data = await fetchBackendJson<{ ok: boolean; prices?: Record<string, { price?: number; change24h?: number }> }>(
+    `/api/token-prices?addresses=${requestKeys.join(',')}&chainId=${chainId}`,
+  );
 
-async function getEtherscanBalance(address: string): Promise<BalanceData | null> {
-  try {
-    if (!ETHERSCAN_API_KEY) return null;
+  if (!data?.ok || !data.prices) return {};
 
-    const response = await fetch(
-      `https://api.etherscan.io/api?module=account&action=balance&address=${address}&tag=latest&apikey=${ETHERSCAN_API_KEY}`
-    );
+  const byAddress = data.prices;
+  const result: Record<string, { price?: number; change24h?: number }> = {};
+  tokenIds.forEach((id) => {
+    const normalized = id.toLowerCase();
+    const key = normalized === 'ethereum' || normalized === 'bitcoin'
+      ? normalized
+      : (TOKEN_ID_TO_ADDRESS[normalized] || (id.startsWith('0x') ? id.toLowerCase() : null));
+    if (key && byAddress[key]) result[id] = byAddress[key];
+  });
 
-    if (!response.ok) return null;
-
-    const data = await response.json();
-    if (data.status === '1') {
-      return {
-        address,
-        balance: data.result || '0',
-      };
-    }
-    return null;
-  } catch (error) {
-    return null;
-  }
-}
-
-// Backend (Moralis server-side) — primary for price. Keys stay on server.
-async function getBackendTokenPrice(contractAddress: string, chainId = 1): Promise<{ price?: number; change24h?: number } | null> {
-  if (!API_BASE) return null;
-  try {
-    const url = `${API_BASE}/api/token-price?address=${encodeURIComponent(contractAddress)}&chainId=${chainId}`;
-    const response = await fetch(url, { credentials: 'include' });
-    if (!response.ok) return null;
-    const data = await response.json();
-    if (data?.ok && (data.price != null || data.change24h != null)) {
-      return { price: data.price ?? undefined, change24h: data.change24h ?? undefined };
-    }
-    return null;
-  } catch (error) {
-    return null;
-  }
-}
-
-
-// FALLBACK CHAIN LOGIC
-export async function getTokenData(contractAddress: string): Promise<TokenData> {
-  // Try providers in order
-  let result = await getMoralisTokenData(contractAddress);
-  if (result) return result;
-  result = await getAlchemyTokenData(contractAddress);
-  if (result) return result;
-  result = await getEtherscanTokenData(contractAddress);
-  if (result) return result;
-  return { symbol: 'UNKNOWN', name: 'Unknown Token', contractAddress };
-}
-
-export async function getBalance(address: string): Promise<BalanceData> {
-  // Try providers in order
-  let result = await getMoralisBalance(address);
-  if (result) return result;
-  result = await getAlchemyBalance(address);
-  if (result) return result;
-  result = await getEtherscanBalance(address);
-  if (result) return result;
-  return { address, balance: '0' };
-}
-
-export async function getTokenPrice(tokenId: string = 'ethereum'): Promise<{ price?: number; change24h?: number }> {
-  const address = TOKEN_ID_TO_ADDRESS[tokenId.toLowerCase()] || (tokenId.startsWith('0x') ? tokenId : null);
-  if (address && API_BASE) {
-    const result = await getBackendTokenPrice(address, 1);
-    if (result) {
-      return result;
-    }
-  }
-  return {};
-}
-
-// Multi-token price fetch: backend (Moralis) first, then CoinGecko
-export async function getMultipleTokenPrices(tokenIds: string[]): Promise<Record<string, { price?: number; change24h?: number }>> {
-  if (API_BASE && tokenIds.length > 0) {
-    const addresses = tokenIds.map((id) => TOKEN_ID_TO_ADDRESS[id.toLowerCase()] || (id.startsWith('0x') ? id : null)).filter(Boolean) as string[];
-    if (addresses.length > 0) {
-      try {
-        const url = `${API_BASE}/api/token-prices?addresses=${addresses.join(',')}&chainId=1`;
-        const response = await fetch(url, { credentials: 'include' });
-        if (response.ok) {
-          const data = await response.json();
-          if (data?.ok && data.prices) {
-            const byAddress = data.prices as Record<string, { price?: number; change24h?: number }>;
-            const result: Record<string, { price?: number; change24h?: number }> = {};
-            tokenIds.forEach((id) => {
-              const addr = TOKEN_ID_TO_ADDRESS[id.toLowerCase()] || (id.startsWith('0x') ? id.toLowerCase() : null);
-              if (addr && byAddress[addr]) result[id] = byAddress[addr];
-            });
-            if (Object.keys(result).length > 0) return result;
-          }
-        }
-      } catch {
-        // failed
-      }
-    }
-  }
-  return {};
+  return result;
 }
 
 export const BlockchainAPI = {

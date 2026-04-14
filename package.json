@@ -12,9 +12,25 @@
     "dev:runtime:dry": "node scripts/dev-runtime.mjs --dry-run",
     "test:e2e:smoke": "node scripts/e2e-siwe-smoke.mjs",
     "doctor": "node scripts/doctor.mjs",
+    "test:security": "npm -w apps/server run test:security",
+    "test:routes": "npm -w apps/server run test:routes",
+    "test:alerts-routes": "npm -w apps/server run test:alerts-routes",
     "build": "turbo build"
   },
   "devDependencies": {
     "turbo": "^2.8.14"
+  },
+  "overrides": {
+    "axios": "1.15.0",
+    "path-to-regexp@^8.0.0": "8.4.2",
+    "express@4.22.1": {
+      "path-to-regexp": "0.1.13"
+    },
+    "anymatch@3.1.3": {
+      "picomatch": "2.3.2"
+    },
+    "readdirp@3.6.0": {
+      "picomatch": "2.3.2"
+    }
   }
 }

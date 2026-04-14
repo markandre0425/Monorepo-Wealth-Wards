@@ -40,9 +40,13 @@ function major(v) {
   return m ? Number(m[1]) : null;
 }
 
-function pass(msg) { console.log(`PASS  ${msg}`); }
-function warn(msg) { console.log(`WARN  ${msg}`); }
-function fail(msg) { console.log(`FAIL  ${msg}`); }
+let passCount = 0;
+let warnCount = 0;
+let failCount = 0;
+
+function pass(msg) { passCount += 1; console.log(`PASS  ${msg}`); }
+function warn(msg) { warnCount += 1; console.log(`WARN  ${msg}`); }
+function fail(msg) { failCount += 1; console.log(`FAIL  ${msg}`); }
 
 async function main() {
   const envText = await readFile('.env', 'utf8').catch(() => '');
@@ -67,6 +71,22 @@ async function main() {
     if (env[key] || process.env[key]) pass(`${key} is set`);
     else fail(`${key} missing (.env or shell)`);
   }
+
+  const moralis =
+    env.MORALIS_API_KEY ||
+    env.VITE_MORALIS_API_KEY ||
+    process.env.MORALIS_API_KEY ||
+    process.env.VITE_MORALIS_API_KEY;
+  if (moralis) pass('Moralis configured (MORALIS_API_KEY or VITE_MORALIS_API_KEY)');
+  else warn('Moralis not set — server Moralis discovery/prices and dashboard Moralis fallbacks are off');
+
+  const alchemy =
+    env.ALCHEMY_API_KEY ||
+    env.VITE_ALCHEMY_API_KEY ||
+    process.env.ALCHEMY_API_KEY ||
+    process.env.VITE_ALCHEMY_API_KEY;
+  if (alchemy) pass('Alchemy configured (ALCHEMY_API_KEY or VITE_ALCHEMY_API_KEY)');
+  else warn('Alchemy not set — server Alchemy paths and dashboard Alchemy fallbacks are off (public RPC used for landing wagmi if no key)');
 
   const backendPort = Number(process.env.BACKEND_PORT || env.PORT || 3002);
   const landingDefault = Number(process.env.LANDING_PORT || 3000);
@@ -116,6 +136,11 @@ async function main() {
   console.log('Suggested next commands:');
   console.log('- npm run test:e2e:smoke');
   console.log('- npm run dev:runtime');
+
+  console.log('');
+  const result = failCount > 0 ? 'FAIL' : 'PASS';
+  console.log(`RESULT  ${result} (pass=${passCount}, warn=${warnCount}, fail=${failCount})`);
+  if (failCount > 0) process.exit(1);
 }
 
 main().catch((err) => {

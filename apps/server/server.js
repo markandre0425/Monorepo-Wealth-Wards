@@ -1523,11 +1523,33 @@ app.get('/api/token-price', expensiveReadLimiter, requireAuth, async (req, res) 
     } catch (e) {
      console.warn('[token-price] Moralis WETH proxy failed:', e.message)
     }
+    // Non-mainnet ETH: Sepolia WETH quote can fail while mainnet WETH still works — reuse mainnet spot for display USD.
+    if (address === 'ethereum' && MORALIS_API_KEY && chainId !== mainnet.id && ALLOWED_CHAIN_IDS.has(chainId)) {
+     const mainWeth = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2'
+     try {
+      const mUrl = `${MORALIS_BASE_URL}/erc20/${mainWeth}/price?chain=eth`
+      const headers = { accept: 'application/json' }
+      if (MORALIS_API_KEY.startsWith('eyJ')) headers['Authorization'] = `Bearer ${MORALIS_API_KEY}`
+      else headers['X-API-Key'] = MORALIS_API_KEY
+      const mRes = await fetch(mUrl, { headers })
+      if (mRes.ok) {
+       const mJson = await mRes.json()
+       const usd = mJson.usdPrice != null ? Number(mJson.usdPrice) : null
+       const change = mJson.usdPrice24hrPercentChange != null ? Number(mJson.usdPrice24hrPercentChange) : (mJson['24hrPercentChange'] != null ? Number(mJson['24hrPercentChange']) : null)
+       if (usd != null || change != null) {
+        await setCachedData(cacheKey, JSON.stringify({ price: usd, change24h: change }), 300)
+        return res.json({ ok: true, price: usd, change24h: change })
+       }
+      }
+     } catch (e) {
+      console.warn('[token-price] Moralis mainnet WETH fallback failed:', e.message)
+     }
+    }
    }
    // CoinGecko often rate-limits or blocks datacenter IPs; match /api/token-prices + Moralis-fallback behavior (no 502 for "price unknown")
    await setCachedData(cacheKey, JSON.stringify({ price: null, change24h: null }), 60)
    return res.json({ ok: true, price: null, change24h: null });
- }
+  }
 
  if (!isAddress(address)) return res.status(400).json({ ok: false, error: 'Invalid address' })
  const moralisChain = getMoralisChain(chainId)
@@ -1609,6 +1631,24 @@ app.get('/api/token-prices', expensiveReadLimiter, requireAuth, async (req, res)
      } catch (e) {
       console.warn('[token-prices] Moralis WETH proxy failed:', e.message)
      }
+     if (address === 'ethereum' && chainId !== mainnet.id && ALLOWED_CHAIN_IDS.has(chainId) && (priceData == null || priceData.price == null)) {
+      const mainWeth = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2'
+      try {
+       const mUrl = `${MORALIS_BASE_URL}/erc20/${mainWeth}/price?chain=eth`
+       const headers = { accept: 'application/json' }
+       if (MORALIS_API_KEY.startsWith('eyJ')) headers['Authorization'] = `Bearer ${MORALIS_API_KEY}`
+       else headers['X-API-Key'] = MORALIS_API_KEY
+       const mRes = await fetch(mUrl, { headers })
+       if (mRes.ok) {
+        const mJson = await mRes.json()
+        const usd = mJson.usdPrice != null ? Number(mJson.usdPrice) : null
+        const change = mJson.usdPrice24hrPercentChange != null ? Number(mJson.usdPrice24hrPercentChange) : (mJson['24hrPercentChange'] != null ? Number(mJson['24hrPercentChange']) : null)
+        if (usd != null || change != null) priceData = { price: usd, change24h: change }
+       }
+      } catch (e) {
+       console.warn('[token-prices] Moralis mainnet WETH fallback failed:', e.message)
+      }
+     }
     }
    } else if (isAddress(address)) {
     const url = `${MORALIS_BASE_URL}/erc20/${address}/price?chain=${moralisChain}`
@@ -1650,6 +1690,81 @@ app.get('/api/token-prices', expensiveReadLimiter, requireAuth, async (req, res)
  })
 
  return res.json({ ok: true, prices })
+})
+
+// GET /api/gas-fee?chainId=1
+// Server-side gas estimate endpoint to avoid browser CORS failures against public RPC providers.
+app.get('/api/gas-fee', expensiveReadLimiter, requireAuth, async (req, res) => {
+ const chainId = Number(req.query.chainId ?? mainnet.id)
+ if (!ALLOWED_CHAIN_IDS.has(chainId)) {
+  return res.status(400).json({ ok: false, error: 'Unsupported chainId' })
+ }
+
+ const cacheKey = `gasfee:${chainId}`
+ const cached = await getCachedData(cacheKey)
+ if (cached) {
+  try {
+   const parsed = JSON.parse(cached)
+   return res.json({ ok: true, ...parsed, cached: true })
+  } catch {
+   // ignore bad cache and continue
+  }
+ }
+
+ try {
+  const client = getPublicClient(chainId)
+
+  // Primary: EIP-1559 style estimate via fee history.
+  let feeHistoryGwei = null
+  try {
+   const feeHistory = await client.request({
+    method: 'eth_feeHistory',
+    params: ['0x5', 'latest', [25, 50, 75]],
+   })
+
+   const baseFees = feeHistory?.baseFeePerGas
+   const rewards = feeHistory?.reward
+
+   if (Array.isArray(baseFees) && baseFees.length > 0 && Array.isArray(rewards) && rewards.length > 0) {
+    const latestBlockIdx = Math.max(0, baseFees.length - 2)
+    const baseWei = BigInt(baseFees[latestBlockIdx] ?? baseFees[baseFees.length - 1] ?? '0x0')
+    const latestRewards = rewards[rewards.length - 1] ?? []
+    const medianPriorityWei = BigInt(latestRewards[1] ?? latestRewards[0] ?? '0x0')
+    const totalWei = baseWei + medianPriorityWei
+    const gwei = Number(totalWei) / 1e9
+    if (Number.isFinite(gwei) && gwei > 0) feeHistoryGwei = gwei
+   }
+  } catch {
+   // fallback below
+  }
+
+  if (feeHistoryGwei != null) {
+   const payload = { gasFeeGwei: feeHistoryGwei, source: 'feeHistory' }
+   await setCachedData(cacheKey, JSON.stringify(payload), 20)
+   return res.json({ ok: true, ...payload })
+  }
+
+  // Fallback: legacy gas price.
+  try {
+   const gasPriceHex = await client.request({ method: 'eth_gasPrice', params: [] })
+   const gasPriceWei = BigInt(gasPriceHex ?? '0x0')
+   const gasPriceGwei = Number(gasPriceWei) / 1e9
+
+   if (Number.isFinite(gasPriceGwei) && gasPriceGwei > 0) {
+    const payload = { gasFeeGwei: gasPriceGwei, source: 'gasPrice' }
+    await setCachedData(cacheKey, JSON.stringify(payload), 20)
+    return res.json({ ok: true, ...payload })
+   }
+  } catch {
+   // Return neutral response below.
+  }
+
+  return res.json({ ok: true, gasFeeGwei: null, source: 'none' })
+ } catch (err) {
+  console.error('Gas fee fetch failed:', err.message)
+  // Keep dashboard stable: avoid 500 spam when upstream RPC is flaky.
+  return res.json({ ok: true, gasFeeGwei: null, source: 'none' })
+ }
 })
 
 // ------------------------------------------------------------------
@@ -1764,7 +1879,7 @@ registerProfileRoutes({
  app,
  requireAuth,
  UserProfile,
- mongoReady,
+ mongoReady: () => mongoReady,
  profileStore,
  getManilaTime,
 })

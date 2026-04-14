@@ -15,8 +15,9 @@ const scaffoldConfig = {
   // The interval at which your front-end polls the RPC servers.
   pollingInterval: 30000,
 
-  // This is placeholders, please replace with your actual keys
-  alchemyApiKey: import.meta.env.VITE_ALCHEMY_API_KEY || "oKsh3Sa8Xm98u-B_EuQSXYA5n93ZzThE",
+  // Dashboard is server-first for chain data and pricing. Keep client key empty by default.
+  // If a future feature needs client-side direct Alchemy access, re-introduce a scoped browser key.
+  alchemyApiKey: '',
   walletConnectProjectId: import.meta.env.VITE_WALLETCONNECT_PROJECT_ID || "3a8170812b53460ff61aa5209772a818",
 
   // Only show the Burner Wallet when running on localhost

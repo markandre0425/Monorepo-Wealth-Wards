@@ -10,6 +10,7 @@ package-lock.json
 .env.*
 **/.env
 **/.env.*
+!.env.example
 
 # OS / editor cruft
 .DS_Store

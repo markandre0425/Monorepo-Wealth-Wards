@@ -27,13 +27,21 @@ export const siweConfig = createSIWEConfig({
   
   getSession: async () => {
     try {
-      // If the backend has a valid session cookie, profile returns the address
-      const res = await fetch(`${API_BASE}/user/profile`)
-      if (!res.ok) return null
-      
-      const { profile } = await res.json()
+      // Source of truth: wallet session endpoint includes address + chainId from SIWE JWT.
+      const walletRes = await fetch(`${API_BASE}/walletAddress`, { credentials: 'include' })
+      if (walletRes.ok) {
+        const wallet = await walletRes.json()
+        if (wallet?.ok && wallet?.address) {
+          return { address: wallet.address, chainId: Number(wallet.chainId ?? 1) }
+        }
+      }
+
+      // Fallback: profile endpoint may still be useful in some auth flows.
+      const profileRes = await fetch(`${API_BASE}/user/profile`, { credentials: 'include' })
+      if (!profileRes.ok) return null
+      const { profile } = await profileRes.json()
       if (profile && profile.address) {
-        return { address: profile.address, chainId: 1 }
+        return { address: profile.address, chainId: Number(profile.chainId ?? 1) }
       }
     } catch {
       return null

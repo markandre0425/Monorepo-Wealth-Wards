@@ -6,9 +6,11 @@
 
 const IS_ELECTRON = typeof navigator !== 'undefined' && navigator.userAgent.includes('Electron');
 
-const API_BASE = IS_ELECTRON 
+// Web dashboard should use same-origin /api to ensure auth cookie is sent reliably.
+// Absolute cross-origin API URLs can break session fetches with SameSite/Lax cookies.
+const API_BASE = IS_ELECTRON
   ? (import.meta.env.VITE_API_URL_ELECTRON as string) || 'http://localhost:3002'
-  : (import.meta.env.VITE_API_URL_WEB as string) || (import.meta.env.VITE_API_URL as string) || '';
+  : '';
 
 export function getApiBase(): string {
   return API_BASE;
@@ -28,6 +30,7 @@ export interface WalletSession {
   provider?: string;
   email?: string | null;
   name?: string | null;
+  chainId?: number | null;
 }
 
 export interface BalanceResponse {

@@ -12,6 +12,13 @@ export interface UserProfile {
   };
 }
 
+// Kept as compatibility helper for older hot-reloaded bundles.
+function formatAddressLabel(address: string | null): string {
+  if (!address) return "Connected Wallet";
+  if (address.length < 12) return address;
+  return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
 // Base URL so avatars work when app is at /dashboard/ (Vite base)
 export const BASE = (import.meta.env.BASE_URL ?? "/").replace(/\/?$/, "/");
 
@@ -75,30 +82,64 @@ const UserProfileContext = createContext<UserProfileContextType>({
 });
 
 // Get API base URL — use same-origin requests by default so the auth
-// cookie set by the /api proxy (same host) is included in every fetch.
-// Only specify an absolute URL when VITE_API_URL_WEB / VITE_API_URL is explicitly provided.
+// cookie set by /api is included in every fetch.
+// Electron keeps explicit backend URL.
 const getApiUrl = () => {
   const IS_ELECTRON = typeof navigator !== 'undefined' && navigator.userAgent.includes('Electron');
   if (IS_ELECTRON) return import.meta.env.VITE_API_URL_ELECTRON || 'http://localhost:3002';
 
-  const apiUrl = import.meta.env.VITE_API_URL_WEB || import.meta.env.VITE_API_URL;
-  if (apiUrl) return apiUrl;
-
-  // Same-origin — works when served behind the root Vite proxy or in production
   return "";
 };
 
+const PROFILE_CACHE_PREFIX = 'ww_profile_cache:';
+const PROFILE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+function readProfileCache(address: string): UserProfile | null {
+  try {
+    const raw = localStorage.getItem(`${PROFILE_CACHE_PREFIX}${address.toLowerCase()}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { profile?: UserProfile; cachedAt?: number; v?: number };
+    if (!parsed?.profile || !parsed?.cachedAt) return null;
+    if (Date.now() - parsed.cachedAt > PROFILE_CACHE_TTL_MS) return null;
+    return parsed.profile;
+  } catch {
+    return null;
+  }
+}
+
+function writeProfileCache(address: string, profile: UserProfile) {
+  try {
+    localStorage.setItem(
+      `${PROFILE_CACHE_PREFIX}${address.toLowerCase()}`,
+      JSON.stringify({ v: 1, cachedAt: Date.now(), profile }),
+    );
+  } catch {
+    // ignore cache write errors
+  }
+}
+
+function clearProfileCache(address: string) {
+  try {
+    localStorage.removeItem(`${PROFILE_CACHE_PREFIX}${address.toLowerCase()}`);
+  } catch {
+    // ignore cache clear errors
+  }
+}
+
 export function UserProfileProvider({ children }: { children: ReactNode }) {
   const [serverProfile, setServerProfile] = useState<UserProfile | null>(null);
+  const [connectedAddress, setConnectedAddress] = useState<string | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Resolved profile: prefer server data, fall back to default
-  const profile = useMemo<UserProfile>(
-    () => (isConnected && serverProfile ? serverProfile : DEFAULT_PROFILE),
-    [isConnected, serverProfile],
-  );
+  // Resolved profile:
+  // - if connected and profile exists: server profile (Mongo-backed)
+  // - otherwise: default profile
+  const profile = useMemo<UserProfile>(() => {
+    if (isConnected && serverProfile) return serverProfile;
+    return DEFAULT_PROFILE;
+  }, [isConnected, serverProfile]);
 
   const fetchProfile = useCallback(async () => {
     setLoading(true);
@@ -106,42 +147,65 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
     try {
       const apiUrl = getApiUrl();
 
-      // Check wallet session via the correct /api/walletAddress endpoint
-      let hasAddress = false;
+      // 1) Primary check: wallet session endpoint
+      let sessionAddress: string | null = null;
       try {
         const session = await getWalletSession();
-        hasAddress = !!session?.address;
+        sessionAddress = session?.address ? String(session.address).toLowerCase() : null;
       } catch {
-        // 401 or network error — no session
-        hasAddress = false;
+        sessionAddress = null;
       }
 
-      setIsConnected(hasAddress);
-      if (!hasAddress) {
-        setServerProfile(null);
-        setLoading(false);
-        return;
-      }
-
-      // Wallet is connected – fetch server profile
+      // 2) Profile fetch (authoritative for actual profile content)
       const response = await fetch(`${apiUrl}/api/user/profile`, {
         method: "GET",
         credentials: "include",
       });
-      if (!response.ok) {
-        if (response.status === 401) {
-          setIsConnected(false);
-          setError(null);
-          return;
+
+      if (response.ok) {
+        const data = await response.json();
+        const profileData = data?.profile as (UserProfile & { address?: string | null }) | null;
+
+        // Connectivity can be derived from either wallet session or authenticated profile payload.
+        const profileAddress = profileData?.address ? String(profileData.address).toLowerCase() : null;
+        const resolvedAddress = sessionAddress ?? profileAddress;
+        const connected = !!resolvedAddress;
+
+        setIsConnected(connected);
+        setConnectedAddress(resolvedAddress);
+
+        if (connected && profileData) {
+          setServerProfile(profileData);
+          writeProfileCache(resolvedAddress, profileData);
+        } else {
+          setServerProfile(null);
+          if (resolvedAddress) clearProfileCache(resolvedAddress);
         }
-        throw new Error(`HTTP ${response.status}`);
+
+        return;
       }
-      const data = await response.json();
-      if (data.profile) {
-        setServerProfile(data.profile);
+
+      if (response.status === 401) {
+        setIsConnected(false);
+        if (sessionAddress) clearProfileCache(sessionAddress);
+        setConnectedAddress(null);
+        setServerProfile(null);
+        return;
       }
+
+      throw new Error(`HTTP ${response.status}`);
     } catch {
-      setError(null); // Don't show error for auth failures
+      // On transient failures, use local cached profile for the same connected wallet.
+      if (sessionAddress) {
+        const cached = readProfileCache(sessionAddress);
+        if (cached) {
+          setIsConnected(true);
+          setConnectedAddress(sessionAddress);
+          setServerProfile(cached);
+        }
+      }
+      // Keep prior UI state on transient failures but avoid noisy auth errors.
+      setError(null);
     } finally {
       setLoading(false);
     }
@@ -162,7 +226,15 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
         throw new Error("Failed to save profile");
       }
       const data = await response.json();
-      setServerProfile(data.profile);
+      if (data?.profile) {
+        setServerProfile(data.profile);
+        setIsConnected(true);
+        if (data.profile.address) {
+          const addr = String(data.profile.address).toLowerCase();
+          setConnectedAddress(addr);
+          writeProfileCache(addr, data.profile);
+        }
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
       setError(message);

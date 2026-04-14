@@ -1,5 +1,3 @@
-process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = 'true'
-
 import { app, BrowserWindow, session } from 'electron'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -9,6 +7,11 @@ const __dirname = path.dirname(__filename)
 
 const isDev = !app.isPackaged || process.env.NODE_ENV === 'development'
 const ELECTRON_URL = process.env.ELECTRON_URL || 'http://localhost:3000/'
+const allowInsecureElectron = process.env.ALLOW_INSECURE_ELECTRON === 'true'
+
+if (isDev) {
+  process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = 'true'
+}
 
 // ── Chromium flags (MUST come before app.whenReady()) ────────────────
 //
@@ -35,11 +38,13 @@ const ELECTRON_URL = process.env.ELECTRON_URL || 'http://localhost:3000/'
 // 5. allow-insecure-localhost
 //    Trusts localhost TLS certs during development so wss:// connections
 //    to dev proxies are not rejected.
-app.commandLine.appendSwitch('ignore-certificate-errors')
 app.commandLine.appendSwitch('disable-gpu-sandbox')
 app.commandLine.appendSwitch('test-type')
 app.commandLine.appendSwitch('ignore-gpu-blocklist')
-app.commandLine.appendSwitch('allow-insecure-localhost')
+if (isDev || allowInsecureElectron) {
+  app.commandLine.appendSwitch('ignore-certificate-errors')
+  app.commandLine.appendSwitch('allow-insecure-localhost')
+}
 
 // ── Window factory ───────────────────────────────────────────────────
 // IMPORTANT: This function must NOT register session-level listeners
@@ -92,25 +97,27 @@ app.whenReady().then(() => {
   // because Electron/Chromium can silently enforce those as secondary CSP
   // policies, blocking wss://relay.walletconnect.org even when the main
   // CSP header allows it.
-  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
-    const headers = { ...details.responseHeaders }
+  if (isDev || allowInsecureElectron) {
+    session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+      const headers = { ...details.responseHeaders }
 
-    // Remove any CSP-related headers that could silently block WebSockets
-    delete headers['x-webkit-csp']
-    delete headers['X-WebKit-CSP']
-    delete headers['content-security-policy-report-only']
-    delete headers['Content-Security-Policy-Report-Only']
+      // Remove any CSP-related headers that could silently block WebSockets
+      delete headers['x-webkit-csp']
+      delete headers['X-WebKit-CSP']
+      delete headers['content-security-policy-report-only']
+      delete headers['Content-Security-Policy-Report-Only']
 
-    // Override with a maximally permissive CSP
-    headers['Content-Security-Policy'] = [
-      "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; " +
-      "img-src * data: blob:; " +
-      "connect-src * ws: wss:; " +
-      "style-src * 'unsafe-inline';",
-    ]
+      // Dev-only permissive CSP for wallet debugging.
+      headers['Content-Security-Policy'] = [
+        "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; " +
+        "img-src * data: blob:; " +
+        "connect-src * ws: wss:; " +
+        "style-src * 'unsafe-inline';",
+      ]
 
-    callback({ responseHeaders: headers })
-  })
+      callback({ responseHeaders: headers })
+    })
+  }
 
   // Tag every outgoing request so the API server can identify Electron
   // clients and set SameSite=None on cookies for cross-origin requests.
@@ -145,16 +152,18 @@ const TRUSTED_WC_HOSTS = [
   'eth-sepolia.g.alchemy.com',
 ]
 
-app.on('certificate-error', (event, _webContents, url, _error, _cert, callback) => {
-  try {
-    const { hostname } = new URL(url)
-    if (TRUSTED_WC_HOSTS.includes(hostname)) {
-      event.preventDefault()
-      return callback(true) // trust this specific host
-    }
-  } catch { /* malformed URL — fall through */ }
-  return callback(false) // default: reject
-})
+if (isDev || allowInsecureElectron) {
+  app.on('certificate-error', (event, _webContents, url, _error, _cert, callback) => {
+    try {
+      const { hostname } = new URL(url)
+      if (TRUSTED_WC_HOSTS.includes(hostname)) {
+        event.preventDefault()
+        return callback(true) // trust this specific host
+      }
+    } catch { /* malformed URL — fall through */ }
+    return callback(false) // default: reject
+  })
+}
 
 app.on('window-all-closed', () => {
   // On macOS, it's common for applications to stay open until the user explicitly quits

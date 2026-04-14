@@ -24,29 +24,22 @@ async function handleSiweFlow(address: string) {
     return;
   }
   siweInProgressCount++;
-  console.log("3. SIWE Flow Started for:", address);
 
   try {
     const msgData = await WagmiAPI.getSiweMessage(address);
-    console.log("4. Message Received from Backend:", msgData);
 
     if (!msgData.ok || !msgData.message) {
       console.error("Failed to get SIWE message from backend:", msgData);
       return;
     }
 
-    console.log("5a. Requesting signature from wallet...");
     const signature = await signMessage(config, { message: msgData.message });
-    console.log("5b. Signature Obtained:", signature);
 
-    console.log("6a. Verifying signature on backend...");
     const result = await WagmiAPI.verifySiweMessage(msgData.message, signature);
-    console.log("6b. Verification Result:", result);
 
     if (result.ok) {
       const dashboardUrl = getDashboardBaseUrl();
       const target = dashboardUrl.replace(/\/?$/, "/dashboard/");
-      console.log("7. Redirecting to:", target);
       window.location.href = target;
     } else {
       console.error("Verification failed on backend:", result);
@@ -59,7 +52,6 @@ async function handleSiweFlow(address: string) {
 }
 
 async function loginHandler() {
-  console.log("1. Login Button Clicked");
   if (IS_ELECTRON && appKitModal) {
     console.info("2. Opening AppKit modal...");
     return appKitModal.open();
@@ -67,9 +59,11 @@ async function loginHandler() {
 
   try {
     const { accounts } = await connect(config, { connector: injected() });
-    console.log("2. Wallet Connected:", accounts[0]);
     await handleSiweFlow(accounts[0]);
   } catch (err) {
+    // UserRejectedRequestError is expected when user closes/rejects MetaMask prompt.
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/User rejected the request|UserRejectedRequestError/i.test(msg)) return;
     console.error("Connection Error:", err);
   }
 }

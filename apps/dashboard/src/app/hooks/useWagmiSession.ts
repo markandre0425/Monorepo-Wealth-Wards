@@ -11,6 +11,7 @@ import {
 
 export interface UseWagmiSessionResult {
   address: string | null;
+  chainId: number | null;
   session: WalletSession | null;
   loading: boolean;
   error: string | null;
@@ -43,6 +44,7 @@ export function useWagmiSession(): UseWagmiSessionResult {
 
   return {
     address: session?.address ?? null,
+    chainId: session?.chainId ?? null,
     session,
     loading,
     error,

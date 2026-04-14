@@ -1,0 +1,61 @@
+name: Dependency Guard
+
+on:
+ pull_request:
+ push:
+  branches:
+   - main
+   - v2
+
+jobs:
+ dependency-guard:
+  runs-on: ubuntu-latest
+
+  steps:
+   - name: Checkout
+    uses: actions/checkout@v4
+
+   - name: Setup Node
+    uses: actions/setup-node@v4
+    with:
+     node-version: '24'
+     cache: npm
+
+   - name: Install dependencies
+    run: npm ci
+
+   - name: Block known compromised Axios versions
+    shell: bash
+    run: |
+     set -euo pipefail
+     echo "Checking axios tree..."
+     npm ls axios --all || true
+
+     if npm ls axios --all 2>/dev/null | grep -E 'axios@(1\.14\.1|0\.30\.4)\b'; then
+      echo "[ERROR] Blocked: known compromised axios version detected in dependency tree"
+      exit 1
+     fi
+
+     if [ -f package-lock.json ] && grep -E '"axios"\s*:\s*"(\^|~)?(1\.14\.1|0\.30\.4)"|axios-1\.14\.1|axios-0\.30\.4' package-lock.json; then
+      echo "[ERROR] Blocked: known compromised axios version detected in lockfile"
+      exit 1
+     fi
+
+     echo "[OK] Axios guard passed"
+
+   - name: Backend production audit (fail on high/critical)
+    run: npm audit --omit=dev --workspace @wagmi/backend --audit-level=high
+
+   - name: Security middleware unit tests
+    run: npm run test:security
+
+   - name: Route module smoke tests
+    run: npm run test:routes
+
+   - name: Alerts route module tests
+    run: npm run test:alerts-routes
+
+   - name: Basic health checks
+    run: |
+     npm run doctor
+     npm run test:e2e:smoke

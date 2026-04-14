@@ -3,7 +3,8 @@
  * Prevents redundant /api/all-assets and /api/balance calls across tabs.
  */
 import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from "react";
-import { getBalanceFromBackend, getAssetsFromBackend, getApiBase } from "../services/wagmi-api";
+import { mainnet, sepolia } from "viem/chains";
+import { getBalanceFromBackend, getAssetsFromBackend } from "../services/wagmi-api";
 import { BlockchainAPI } from "../services/blockchain-api";
 import { useWagmiSession } from "../hooks/useWagmiSession";
 
@@ -21,6 +22,8 @@ export interface PortfolioData {
   cscrHoldings: number;
   loading: boolean;
   assets: any[];
+  fetchStatus: "idle" | "ok" | "error" | "disconnected";
+  fetchMessage: string | null;
 }
 
 const DEFAULT_PORTFOLIO: PortfolioData = {
@@ -34,15 +37,21 @@ const DEFAULT_PORTFOLIO: PortfolioData = {
   cscrHoldings: 0,
   loading: true,
   assets: [],
+  fetchStatus: "idle",
+  fetchMessage: null,
 };
 
 interface PortfolioContextValue extends PortfolioData {
   refetch: () => void;
+  activeChainId: number;
+  setActiveChainId: (chainId: number) => void;
 }
 
 const PortfolioContext = createContext<PortfolioContextValue>({
   ...DEFAULT_PORTFOLIO,
   refetch: () => {},
+  activeChainId: 1,
+  setActiveChainId: () => {},
 });
 
 export function usePortfolio(): PortfolioContextValue {
@@ -50,17 +59,33 @@ export function usePortfolio(): PortfolioContextValue {
 }
 
 export function PortfolioProvider({ children }: { children: ReactNode }) {
-  const { address } = useWagmiSession();
+  const { address, chainId } = useWagmiSession();
   const [data, setData] = useState<PortfolioData>(DEFAULT_PORTFOLIO);
   const [fetchCount, setFetchCount] = useState(0);
+  const [activeChainId, setActiveChainId] = useState<number>(chainId ?? 1);
+  const [hasUserSelectedChain, setHasUserSelectedChain] = useState(false);
 
   const refetch = useCallback(() => {
     setFetchCount((c) => c + 1);
   }, []);
 
+  const handleSetActiveChainId = useCallback((nextChainId: number) => {
+    setHasUserSelectedChain(true);
+    setActiveChainId(nextChainId);
+  }, []);
+
+  useEffect(() => {
+    // Keep session chain as default until user explicitly picks from dropdown.
+    // Once user picks, don't override with session chain on subsequent renders.
+    if (!chainId || hasUserSelectedChain) return;
+    if (chainId !== activeChainId) {
+      setActiveChainId(chainId);
+    }
+  }, [chainId, activeChainId, hasUserSelectedChain]);
+
   useEffect(() => {
     if (!address) {
-      setData({ ...DEFAULT_PORTFOLIO, loading: false });
+      setData({ ...DEFAULT_PORTFOLIO, loading: false, fetchStatus: "disconnected", fetchMessage: "Connect wallet to load portfolio" });
       return;
     }
 
@@ -68,9 +93,10 @@ export function PortfolioProvider({ children }: { children: ReactNode }) {
 
     async function fetchPortfolio() {
       try {
+        const effectiveChainId = activeChainId;
         const [balanceRes, assetsRes] = await Promise.all([
-          getBalanceFromBackend(1),
-          getAssetsFromBackend(address!, 1),
+          getBalanceFromBackend(effectiveChainId),
+          getAssetsFromBackend(address!, effectiveChainId),
         ]);
 
         if (cancelled) return;
@@ -97,10 +123,25 @@ export function PortfolioProvider({ children }: { children: ReactNode }) {
           if (a.contractAddress?.toLowerCase() === cscrLower) cscrHoldings = bal;
         }
 
+        const chainNum = Number(effectiveChainId);
         let ethPrice = 0;
+        const applyEthSpot = (p: unknown) => {
+          if (p == null || typeof p !== "number" || !Number.isFinite(p) || p <= 0) return false;
+          ethPrice = p;
+          return true;
+        };
         try {
-          const priceRes = await BlockchainAPI.getTokenPrice("ethereum");
-          if (priceRes?.price != null) ethPrice = priceRes.price;
+          // Sepolia: prefer mainnet ETH spot for USD (testnet rarely has a reliable native quote).
+          if (chainNum === sepolia.id) {
+            const mainSpot = await BlockchainAPI.getTokenPrice("ethereum", mainnet.id);
+            if (!applyEthSpot(mainSpot?.price as number)) {
+              const sepSpot = await BlockchainAPI.getTokenPrice("ethereum", chainNum);
+              applyEthSpot(sepSpot?.price as number);
+            }
+          } else {
+            const priceRes = await BlockchainAPI.getTokenPrice("ethereum", chainNum);
+            applyEthSpot(priceRes?.price as number);
+          }
         } catch {
           /* keep 0 */
         }
@@ -110,7 +151,7 @@ export function PortfolioProvider({ children }: { children: ReactNode }) {
 
         if (contractAddresses.length > 0) {
           try {
-            const prices = await BlockchainAPI.getMultipleTokenPrices(contractAddresses);
+            const prices = await BlockchainAPI.getMultipleTokenPrices(contractAddresses, effectiveChainId);
             for (const a of assets) {
               const balParsed = parseFloat(String(a.balance ?? "0"));
               const bal = Number.isFinite(balParsed) ? balParsed : 0;
@@ -140,10 +181,13 @@ export function PortfolioProvider({ children }: { children: ReactNode }) {
           cscrHoldings,
           loading: false,
           assets,
+          fetchStatus: "ok",
+          fetchMessage: null,
         });
-      } catch {
+      } catch (error) {
         if (!cancelled) {
-          setData({ ...DEFAULT_PORTFOLIO, loading: false });
+          const message = error instanceof Error ? error.message : "Failed to load portfolio";
+          setData({ ...DEFAULT_PORTFOLIO, loading: false, fetchStatus: "error", fetchMessage: message });
         }
       }
     }
@@ -152,10 +196,10 @@ export function PortfolioProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [address, fetchCount]);
+  }, [address, activeChainId, fetchCount]);
 
   return (
-    <PortfolioContext.Provider value={{ ...data, refetch }}>
+    <PortfolioContext.Provider value={{ ...data, refetch, activeChainId, setActiveChainId: handleSetActiveChainId }}>
       {children}
     </PortfolioContext.Provider>
   );
