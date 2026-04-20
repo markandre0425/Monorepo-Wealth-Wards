@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useEffect, useCallback, useMemo, type ReactNode } from "react";
 import { getWalletSession } from "../services/wagmi-api";
+import { contextProviderProps } from "./controlled-dom-props";
 
 export interface UserProfile {
   displayName: string;
@@ -144,11 +145,11 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
   const fetchProfile = useCallback(async () => {
     setLoading(true);
     setError(null);
+    let sessionAddress: string | null = null;
     try {
       const apiUrl = getApiUrl();
 
       // 1) Primary check: wallet session endpoint
-      let sessionAddress: string | null = null;
       try {
         const session = await getWalletSession();
         sessionAddress = session?.address ? String(session.address).toLowerCase() : null;
@@ -163,8 +164,8 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
       });
 
       if (response.ok) {
-        const data = await response.json();
-        const profileData = data?.profile as (UserProfile & { address?: string | null }) | null;
+        const profileResponseJson = await response.json();
+        const profileData = profileResponseJson?.profile as (UserProfile & { address?: string | null }) | null;
 
         // Connectivity can be derived from either wallet session or authenticated profile payload.
         const profileAddress = profileData?.address ? String(profileData.address).toLowerCase() : null;
@@ -225,14 +226,14 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
       if (!response.ok) {
         throw new Error("Failed to save profile");
       }
-      const data = await response.json();
-      if (data?.profile) {
-        setServerProfile(data.profile);
+      const saveProfileJson = await response.json();
+      if (saveProfileJson?.profile) {
+        setServerProfile(saveProfileJson.profile);
         setIsConnected(true);
-        if (data.profile.address) {
-          const addr = String(data.profile.address).toLowerCase();
+        if (saveProfileJson.profile.address) {
+          const addr = String(saveProfileJson.profile.address).toLowerCase();
           setConnectedAddress(addr);
-          writeProfileCache(addr, data.profile);
+          writeProfileCache(addr, saveProfileJson.profile);
         }
       }
     } catch (err) {
@@ -249,17 +250,20 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
     fetchProfile();
   }, [fetchProfile]);
 
+  const profileContextPayload = useMemo(
+    () => ({
+      profile,
+      isConnected,
+      loading,
+      error,
+      updateProfile,
+      fetchProfile,
+    }),
+    [profile, isConnected, loading, error, updateProfile, fetchProfile],
+  );
+
   return (
-    <UserProfileContext.Provider
-      value={{
-        profile,
-        isConnected,
-        loading,
-        error,
-        updateProfile,
-        fetchProfile,
-      }}
-    >
+    <UserProfileContext.Provider {...contextProviderProps(profileContextPayload)}>
       {children}
     </UserProfileContext.Provider>
   );

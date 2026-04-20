@@ -11,7 +11,8 @@ const publicClient = createPublicClient({
 });
 
 interface AddressInputProps {
-  value: string;
+  /** Current address or ENS name (controlled). */
+  addressText: string;
   onChange: (val: string) => void;
   placeholder?: string;
   disabled?: boolean;
@@ -20,18 +21,18 @@ interface AddressInputProps {
 /**
  * Reusable AddressInput component for hex addresses and ENS support.
  */
-export const AddressInput = ({ value, onChange, placeholder = "Address (0x... or ENS)", disabled }: AddressInputProps) => {
+export const AddressInput = ({ addressText, onChange, placeholder = "Address (0x... or ENS)", disabled }: AddressInputProps) => {
   const [isEns, setIsEns] = useState(false);
   const [resolvedAddress, setResolvedAddress] = useState<string | null>(null);
   const [isResolving, setIsResolving] = useState(false);
 
   useEffect(() => {
     const checkEns = async () => {
-      if (value.endsWith(".eth")) {
+      if (addressText.endsWith(".eth")) {
         setIsEns(true);
         setIsResolving(true);
         try {
-          const address = await publicClient.getEnsAddress({ name: value });
+          const address = await publicClient.getEnsAddress({ name: addressText });
           setResolvedAddress(address);
         } catch (e) {
           setResolvedAddress(null);
@@ -47,9 +48,9 @@ export const AddressInput = ({ value, onChange, placeholder = "Address (0x... or
 
     const timer = setTimeout(checkEns, 500);
     return () => clearTimeout(timer);
-  }, [value]);
+  }, [addressText]);
 
-  const isValid = !value || isAddress(value) || (isEns && !!resolvedAddress);
+  const isValid = !addressText || isAddress(addressText) || (isEns && !!resolvedAddress);
 
   return (
     <div className="relative w-full">
@@ -58,8 +59,8 @@ export const AddressInput = ({ value, onChange, placeholder = "Address (0x... or
           isValid ? "border-transparent focus:border-[#0FC6C2]/50" : "border-red-500/50 focus:border-red-500"
         } ${disabled ? "opacity-50 cursor-not-allowed" : ""}`}
         placeholder={placeholder}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
+        value={addressText}
+        onChange={(changeEvent) => onChange(changeEvent.target.value)}
         disabled={disabled}
       />
       {isEns && isValid && !isResolving && (

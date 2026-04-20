@@ -15,6 +15,9 @@ import { useUserProfile } from "./user-profile-context";
 import logoIcon from "@/assets/newicon.png";
 import { Button } from "./button-styles";
 import { useIsMobile } from "./ui/use-mobile";
+import { mainnet } from "viem/chains";
+import { GasFeeStrip } from "./gas-fee-strip";
+import { useWagmiSession } from "../hooks/useWagmiSession";
 import { logoutFromBackend } from "../services/wagmi-api";
 import { DEFAULT_AVATAR_PATH } from "./user-profile-context";
 
@@ -184,6 +187,8 @@ function Sidebar() {
   const location = useLocation();
   const { isDark } = useTheme();
   const tc = themeColors(isDark);
+  const { chainId } = useWagmiSession();
+  const gasChainId = chainId ?? mainnet.id;
 
   const isActive = (path: string) => {
     if (path === "/") return location.pathname === "/";
@@ -192,12 +197,12 @@ function Sidebar() {
 
   return (
     <div
-      className="flex flex-col w-[280px] shrink-0 h-full pt-[20px] pb-[40px]"
+      className="flex flex-col w-[280px] shrink-0 h-full min-h-0 pt-[20px] pb-[40px]"
       style={{ background: tc.sidebarBg }}
     >
       {/* Logo area */}
       <div
-        className="flex items-center gap-[8px] px-[20px] mb-[40px] cursor-pointer"
+        className="flex items-center gap-[8px] px-[20px] mb-[40px] cursor-pointer shrink-0"
         onClick={() => navigate("/")}
       >
         <div className="size-[85px] relative shrink-0 overflow-hidden rounded-lg">
@@ -209,53 +214,65 @@ function Sidebar() {
         </div>
       </div>
 
-      {/* Nav items */}
-      <div className="flex flex-col gap-[8px] px-[25px] flex-1">
-        {navItems.map((item) => {
-          const active = isActive(item.path);
-          const Icon = item.icon;
-          return (
-            <button
-              key={item.path}
-              onClick={() => navigate(item.path)}
-              className={`flex gap-[19px] items-center px-[25px] py-[16px] rounded-[16px] cursor-pointer transition-all duration-200 ${active ? "" : ""
-                }`}
-              style={
-                active
-                  ? {
-                    backgroundImage:
-                      "linear-gradient(129.101deg, rgb(31, 142, 190) 5.3557%, rgb(68, 4, 149) 29.462%, rgb(68, 4, 149) 56.025%, rgb(177, 2, 205) 81.92%)",
+      {/* Nav + gas (scrolls); Log out pinned to bottom — same as mobile drawer */}
+      <div className="flex flex-col flex-1 min-h-0 w-full">
+        <div className="flex flex-1 flex-col gap-[8px] overflow-y-auto px-[25px] min-h-0">
+          {navItems.map((item) => {
+            const active = isActive(item.path);
+            const Icon = item.icon;
+            return (
+              <div key={item.path} className="flex flex-col gap-[8px]">
+                <button
+                  onClick={() => navigate(item.path)}
+                  className={`flex gap-[19px] items-center px-[25px] py-[16px] rounded-[16px] cursor-pointer transition-all duration-200 ${active ? "" : ""
+                    }`}
+                  style={
+                    active
+                      ? {
+                        backgroundImage:
+                          "linear-gradient(129.101deg, rgb(31, 142, 190) 5.3557%, rgb(68, 4, 149) 29.462%, rgb(68, 4, 149) 56.025%, rgb(177, 2, 205) 81.92%)",
+                      }
+                      : { backgroundColor: "transparent" }
                   }
-                  : { backgroundColor: "transparent" }
-              }
-              onMouseEnter={(e) => {
-                if (!active) e.currentTarget.style.backgroundColor = tc.hoverBg;
-              }}
-              onMouseLeave={(e) => {
-                if (!active) e.currentTarget.style.backgroundColor = "transparent";
-              }}
-            >
-              <Icon />
-              <p
-                className="font-['Inter',sans-serif] font-medium text-[18px]"
-                style={{ color: active ? "#ffffff" : tc.textMuted }}
-              >
-                {item.label}
-              </p>
-            </button>
-          );
-        })}
+                  onMouseEnter={(e) => {
+                    if (!active) e.currentTarget.style.backgroundColor = tc.hoverBg;
+                  }}
+                  onMouseLeave={(e) => {
+                    if (!active) e.currentTarget.style.backgroundColor = "transparent";
+                  }}
+                >
+                  <Icon />
+                  <p
+                    className="font-['Inter',sans-serif] font-medium text-[18px]"
+                    style={{ color: active ? "#ffffff" : tc.textMuted }}
+                  >
+                    {item.label}
+                  </p>
+                </button>
+                {item.path === "/transactions" && (
+                  <div className="w-full">
+                    <GasFeeStrip chainId={gasChainId} compact />
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
 
-        {/* Log Out */}
-        <button
-          className="flex gap-[19px] items-center px-[25px] py-[16px] rounded-[16px] cursor-pointer hover:opacity-80 transition-opacity mt-auto"
-          onClick={async () => {
-            await logoutAndRedirectToLanding();
-          }}
+        <div
+          className="shrink-0 px-[25px] pt-[16px] mt-auto"
+          style={{ borderTop: `1px solid ${isDark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)"}` }}
         >
-          <LogoutIcon />
-          <p className="font-['Inter',sans-serif] font-medium text-[18px]" style={{ color: tc.textMuted }}>Log Out</p>
-        </button>
+          <button
+            className="flex gap-[19px] items-center px-[25px] py-[16px] rounded-[16px] cursor-pointer hover:opacity-80 transition-opacity w-full"
+            onClick={async () => {
+              await logoutAndRedirectToLanding();
+            }}
+          >
+            <LogoutIcon />
+            <p className="font-['Inter',sans-serif] font-medium text-[18px]" style={{ color: tc.textMuted }}>Log Out</p>
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -268,10 +285,12 @@ function TopBar() {
   const { isDark } = useTheme();
   const tc = themeColors(isDark);
   const { profile, isConnected } = useUserProfile();
+  const { address: sessionAddress } = useWagmiSession();
+  const walletLinked = isConnected || !!sessionAddress;
 
   return (
     <div className="flex items-center justify-end gap-[16px] px-[20px] py-[16px] shrink-0">
-      {!isConnected && (
+      {!walletLinked && (
         <a
           href="/app/?connect=1"
           target="_top"
@@ -319,6 +338,9 @@ function SafeArea({ children }: { children: React.ReactNode }) {
 function MobileHeader({ onMenuClick }: { onMenuClick: () => void }) {
   const { isDark } = useTheme();
   const tc = themeColors(isDark);
+  const { isConnected } = useUserProfile();
+  const { address: sessionAddress } = useWagmiSession();
+  const walletLinked = isConnected || !!sessionAddress;
 
   return (
     <div
@@ -336,14 +358,16 @@ function MobileHeader({ onMenuClick }: { onMenuClick: () => void }) {
         <HamburgerIcon />
       </button>
       <div className="flex-1" />
-      <a
-        href="/app/?connect=1"
-        target="_top"
-        rel="noopener noreferrer"
-        className="inline-block"
-      >
-        <Button size="sm">Connect Account</Button>
-      </a>
+      {!walletLinked && (
+        <a
+          href="/app/?connect=1"
+          target="_top"
+          rel="noopener noreferrer"
+          className="inline-block"
+        >
+          <Button size="sm">Connect Account</Button>
+        </a>
+      )}
     </div>
   );
 }
@@ -355,6 +379,8 @@ function MobileSidebarOverlay({ isOpen, onClose }: { isOpen: boolean; onClose: (
   const location = useLocation();
   const { isDark } = useTheme();
   const tc = themeColors(isDark);
+  const { chainId } = useWagmiSession();
+  const gasChainId = chainId ?? mainnet.id;
 
   const isActive = (path: string) => {
     if (path === "/") return location.pathname === "/";
@@ -378,7 +404,7 @@ function MobileSidebarOverlay({ isOpen, onClose }: { isOpen: boolean; onClose: (
 
       {/* Sidebar */}
       <div
-        className={`fixed left-0 top-0 h-full w-[280px] flex flex-col pt-[20px] pb-[40px] z-50 transition-transform duration-300 ease-in-out backdrop-blur-[24px] ${isOpen ? "translate-x-0" : "-translate-x-full"
+        className={`fixed left-0 top-0 h-full min-h-0 w-[280px] flex flex-col pt-[20px] pb-[40px] z-50 transition-transform duration-300 ease-in-out backdrop-blur-[24px] ${isOpen ? "translate-x-0" : "-translate-x-full"
           }`}
         style={{
           background: isDark ? 'rgba(11,11,15,0.92)' : 'rgba(255,255,255,0.88)',
@@ -411,52 +437,64 @@ function MobileSidebarOverlay({ isOpen, onClose }: { isOpen: boolean; onClose: (
           </div>
         </div>
 
-        {/* Nav items */}
-        <div className="flex flex-col gap-[8px] px-[25px] flex-1">
-          {navItems.map((item) => {
-            const active = isActive(item.path);
-            const Icon = item.icon;
-            return (
-              <button
-                key={item.path}
-                onClick={() => handleNavClick(item.path)}
-                className={`flex gap-[19px] items-center px-[25px] py-[16px] rounded-[16px] cursor-pointer transition-all duration-200`}
-                style={
-                  active
-                    ? {
-                      backgroundImage:
-                        "linear-gradient(129.101deg, rgb(31, 142, 190) 5.3557%, rgb(68, 4, 149) 29.462%, rgb(68, 4, 149) 56.025%, rgb(177, 2, 205) 81.92%)",
+        {/* Nav + gas (scrolls); Log out pinned to bottom */}
+        <div className="flex flex-col flex-1 min-h-0 w-full">
+          <div className="flex flex-1 flex-col gap-[8px] overflow-y-auto px-[25px] min-h-0">
+            {navItems.map((item) => {
+              const active = isActive(item.path);
+              const Icon = item.icon;
+              return (
+                <div key={item.path} className="flex flex-col gap-[8px]">
+                  <button
+                    onClick={() => handleNavClick(item.path)}
+                    className={`flex gap-[19px] items-center px-[25px] py-[16px] rounded-[16px] cursor-pointer transition-all duration-200`}
+                    style={
+                      active
+                        ? {
+                          backgroundImage:
+                            "linear-gradient(129.101deg, rgb(31, 142, 190) 5.3557%, rgb(68, 4, 149) 29.462%, rgb(68, 4, 149) 56.025%, rgb(177, 2, 205) 81.92%)",
+                        }
+                        : { backgroundColor: "transparent" }
                     }
-                    : { backgroundColor: "transparent" }
-                }
-                onMouseEnter={(e) => {
-                  if (!active) e.currentTarget.style.backgroundColor = tc.hoverBg;
-                }}
-                onMouseLeave={(e) => {
-                  if (!active) e.currentTarget.style.backgroundColor = "transparent";
-                }}
-              >
-                <Icon />
-                <p
-                  className="font-['Inter',sans-serif] font-medium text-[18px]"
-                  style={{ color: active ? "#ffffff" : tc.textMuted }}
-                >
-                  {item.label}
-                </p>
-              </button>
-            );
-          })}
+                    onMouseEnter={(e) => {
+                      if (!active) e.currentTarget.style.backgroundColor = tc.hoverBg;
+                    }}
+                    onMouseLeave={(e) => {
+                      if (!active) e.currentTarget.style.backgroundColor = "transparent";
+                    }}
+                  >
+                    <Icon />
+                    <p
+                      className="font-['Inter',sans-serif] font-medium text-[18px]"
+                      style={{ color: active ? "#ffffff" : tc.textMuted }}
+                    >
+                      {item.label}
+                    </p>
+                  </button>
+                  {item.path === "/transactions" && (
+                    <div className="w-full">
+                      <GasFeeStrip chainId={gasChainId} compact />
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
 
-          {/* Log Out */}
-          <button
-            className="flex gap-[19px] items-center px-[25px] py-[16px] rounded-[16px] cursor-pointer hover:opacity-80 transition-opacity mt-auto"
-            onClick={async () => {
-              await logoutAndRedirectToLanding();
-            }}
+          <div
+            className="shrink-0 px-[25px] pt-[16px] mt-auto"
+            style={{ borderTop: `1px solid ${isDark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)"}` }}
           >
-            <LogoutIcon />
-            <p className="font-['Inter',sans-serif] font-medium text-[18px]" style={{ color: tc.textMuted }}>Log Out</p>
-          </button>
+            <button
+              className="flex gap-[19px] items-center px-[25px] py-[16px] rounded-[16px] cursor-pointer hover:opacity-80 transition-opacity w-full"
+              onClick={async () => {
+                await logoutAndRedirectToLanding();
+              }}
+            >
+              <LogoutIcon />
+              <p className="font-['Inter',sans-serif] font-medium text-[18px]" style={{ color: tc.textMuted }}>Log Out</p>
+            </button>
+          </div>
         </div>
       </div>
     </>

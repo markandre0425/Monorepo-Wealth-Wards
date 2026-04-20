@@ -82,11 +82,11 @@ app.use(compression()) // Gzip all responses
 
 // Config trust proxy deployment env
 const TRUST_PROXY_SETTING = (() => {
- const value = process.env.TRUST_PROXY;
- if (value === 'true') return true;
- if (value === 'false') return false;
- if (!isNaN(Number(value))) return Number(value);
- return value ?? 'loopback'; // Default to 'loopback' for local dev
+ const envTrustProxy = process.env.TRUST_PROXY;
+ if (envTrustProxy === 'true') return true;
+ if (envTrustProxy === 'false') return false;
+ if (!isNaN(Number(envTrustProxy))) return Number(envTrustProxy);
+ return envTrustProxy ?? 'loopback'; // Default to 'loopback' for local dev
 })();
 app.set('trust proxy', TRUST_PROXY_SETTING);
 
@@ -1249,8 +1249,8 @@ async function fetchMoralisAssets(address, chainId) {
 
   const response = await fetch(url, { method: 'GET', headers });
   if (!response.ok) return [];
-  const data = await response.json();
-  const tokens = data.result ?? [];
+  const moralisWalletJson = await response.json();
+  const tokens = moralisWalletJson.result ?? [];
 
   return tokens.map((token) => ({
    contractAddress: token.token_address,
@@ -1423,11 +1423,11 @@ async function fetchCoinGeckoPrice(address) {
 
   // Primary: CoinGecko
   const cgUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd&include_24hr_change=true`;
-  const res = await fetch(cgUrl, { headers: { 'accept': 'application/json' } });
-  if (res.ok) {
-   const data = await res.json();
-   const usd = data?.[cgId]?.usd;
-   const chg = data?.[cgId]?.usd_24h_change;
+  const coingeckoHttpResponse = await fetch(cgUrl, { headers: { 'accept': 'application/json' } });
+  if (coingeckoHttpResponse.ok) {
+   const coingeckoPriceJson = await coingeckoHttpResponse.json();
+   const usd = coingeckoPriceJson?.[cgId]?.usd;
+   const chg = coingeckoPriceJson?.[cgId]?.usd_24h_change;
    if (usd != null || chg != null) {
     return {
      usdPrice: usd != null ? Number(usd) : null,
@@ -1442,8 +1442,9 @@ async function fetchCoinGeckoPrice(address) {
    headers: { 'accept': 'application/json' },
   });
   if (cb.ok) {
-   const data = await cb.json();
-   const amount = data?.data?.amount;
+   const coinbaseSpotJson = await cb.json();
+   const coinbaseSpotNode = coinbaseSpotJson?.['data']
+   const amount = coinbaseSpotNode?.amount;
    const usd = amount != null ? Number(amount) : null;
    if (usd != null && Number.isFinite(usd)) {
     return {
@@ -1571,9 +1572,9 @@ app.get('/api/token-price', expensiveReadLimiter, requireAuth, async (req, res) 
    await setCachedData(cacheKey, JSON.stringify({ price: null, change24h: null }), 60)
    return res.json({ ok: true, price: null, change24h: null });
   }
-  const data = await response.json()
-  const usd = data.usdPrice != null ? Number(data.usdPrice) : null
-  const change = data.usdPrice24hrPercentChange != null ? Number(data.usdPrice24hrPercentChange) : (data['24hrPercentChange'] != null ? Number(data['24hrPercentChange']) : null)
+  const moralisTokenPriceBody = await response.json()
+  const usd = moralisTokenPriceBody.usdPrice != null ? Number(moralisTokenPriceBody.usdPrice) : null
+  const change = moralisTokenPriceBody.usdPrice24hrPercentChange != null ? Number(moralisTokenPriceBody.usdPrice24hrPercentChange) : (moralisTokenPriceBody['24hrPercentChange'] != null ? Number(moralisTokenPriceBody['24hrPercentChange']) : null)
   
   // Cache Result
   await setCachedData(cacheKey, JSON.stringify({ price: usd, change24h: change }), 300)
@@ -1601,7 +1602,7 @@ app.get('/api/token-prices', expensiveReadLimiter, requireAuth, async (req, res)
   
   // 1. Check Cache First
   const cached = await getCachedData(cacheKey)
-  if (cached) return { address, data: JSON.parse(cached) }
+  if (cached) return { address, quote: JSON.parse(cached) }
 
   // 2. Fetch if not cached
   try {
@@ -1658,10 +1659,10 @@ app.get('/api/token-prices', expensiveReadLimiter, requireAuth, async (req, res)
 
     const response = await fetch(url, { headers })
     if (response.ok) {
-     const data = await response.json()
-     const change = data.usdPrice24hrPercentChange != null ? Number(data.usdPrice24hrPercentChange) : (data['24hrPercentChange'] != null ? Number(data['24hrPercentChange']) : null)
+     const moralisErc20PriceBody = await response.json()
+     const change = moralisErc20PriceBody.usdPrice24hrPercentChange != null ? Number(moralisErc20PriceBody.usdPrice24hrPercentChange) : (moralisErc20PriceBody['24hrPercentChange'] != null ? Number(moralisErc20PriceBody['24hrPercentChange']) : null)
      priceData = {
-      price: data.usdPrice != null ? Number(data.usdPrice) : null,
+      price: moralisErc20PriceBody.usdPrice != null ? Number(moralisErc20PriceBody.usdPrice) : null,
       change24h: change,
      }
     } else {
@@ -1672,7 +1673,7 @@ app.get('/api/token-prices', expensiveReadLimiter, requireAuth, async (req, res)
 
    if (priceData) {
     await setCachedData(cacheKey, JSON.stringify(priceData), 300)
-    return { address, data: priceData }
+    return { address, quote: priceData }
    } else {
     // Cache failure for 1 minute
     await setCachedData(cacheKey, JSON.stringify({ price: null, change24h: null }), 60)
@@ -1680,13 +1681,13 @@ app.get('/api/token-prices', expensiveReadLimiter, requireAuth, async (req, res)
   } catch (e) {
    console.warn('Token price for', address, e.message)
   }
-  return { address, data: null }
+  return { address, quote: null }
  })
 
  const resultsArr = await Promise.all(pricePromises)
  const prices = {}
- resultsArr.forEach(r => {
-  if (r.data) prices[r.address] = r.data
+ resultsArr.forEach((row) => {
+  if (row.quote) prices[row.address] = row.quote
  })
 
  return res.json({ ok: true, prices })
@@ -1764,6 +1765,74 @@ app.get('/api/gas-fee', expensiveReadLimiter, requireAuth, async (req, res) => {
   console.error('Gas fee fetch failed:', err.message)
   // Keep dashboard stable: avoid 500 spam when upstream RPC is flaky.
   return res.json({ ok: true, gasFeeGwei: null, source: 'none' })
+ }
+})
+
+// GET /api/token-holder-count?contractAddress=0x...
+// Uses Ethplorer getTokenInfo (holdersCount). Free tier: apiKey=freekey — set ETHPLORER_API_KEY for higher limits.
+// Etherscan tokenholdercount requires a paid plan; Ethplorer is reliable for public holder counts on mainnet.
+// Only CSCS / CSCR (see PINNED_TOKEN_ADDRESSES on mainnet).
+const TOKEN_HOLDER_ALLOWED = new Set(PINNED_TOKEN_ADDRESSES.map((a) => a.toLowerCase()))
+const ETHPLORER_API_BASE = 'https://api.ethplorer.io'
+const ETHPLORER_API_KEY = process.env.ETHPLORER_API_KEY ?? 'freekey'
+
+app.get('/api/token-holder-count', expensiveReadLimiter, requireAuth, async (req, res) => {
+ const raw = req.query.contractAddress
+ if (typeof raw !== 'string' || !raw.trim()) {
+  return res.status(400).json({ ok: false, error: 'contractAddress is required' })
+ }
+ const normalized = raw.trim().toLowerCase()
+ if (!TOKEN_HOLDER_ALLOWED.has(normalized)) {
+  return res.status(400).json({ ok: false, error: 'Only CSCS and CSCR contracts are supported' })
+ }
+
+ const cacheKey = `tokenHolders:${normalized}`
+ const cached = await getCachedData(cacheKey)
+ if (cached) {
+  try {
+   const parsed = JSON.parse(cached)
+   if (parsed && typeof parsed.holderCount === 'number' && Number.isFinite(parsed.holderCount)) {
+    return res.json({ ok: true, holderCount: parsed.holderCount, cached: true })
+   }
+  } catch {
+   // continue to fetch
+  }
+ }
+
+ const url = `${ETHPLORER_API_BASE}/getTokenInfo/${encodeURIComponent(raw.trim())}?apiKey=${encodeURIComponent(ETHPLORER_API_KEY)}`
+
+ try {
+  const upstream = await fetch(url, {
+   method: 'GET',
+   headers: { accept: 'application/json' },
+  })
+  const text = await upstream.text()
+  let json
+  try {
+   json = JSON.parse(text)
+  } catch {
+   return res.status(502).json({ ok: false, error: 'Invalid Ethplorer response' })
+  }
+
+  if (json?.error && typeof json.error === 'object') {
+   const msg = json.error.message ?? json.error.code ?? 'Ethplorer error'
+   return res.status(502).json({ ok: false, error: String(msg) })
+  }
+
+  const rawCount = json?.holdersCount
+  const parsedHolderCount =
+   typeof rawCount === 'number'
+    ? rawCount
+    : parseInt(String(rawCount ?? ''), 10)
+  if (!Number.isFinite(parsedHolderCount) || parsedHolderCount < 0) {
+   return res.status(502).json({ ok: false, error: 'Holder count unavailable for this token' })
+  }
+
+  await setCachedData(cacheKey, JSON.stringify({ holderCount: parsedHolderCount }), 120)
+  return res.json({ ok: true, holderCount: parsedHolderCount })
+ } catch (err) {
+  console.error('token-holder-count:', err.message)
+  return res.status(502).json({ ok: false, error: err.message || 'Upstream request failed' })
  }
 })
 

@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback } from "react";
-import { mainnet, sepolia } from "viem/chains";
 import { toast } from "sonner";
 import {
  AreaChart,
@@ -26,10 +25,17 @@ import { useUserProfile, DEFAULT_AVATAR_PATH } from "./user-profile-context";
 import { Button, PrimaryButton, SecondaryButton } from "./button-styles";
 import { BlockchainAPI } from "../services/blockchain-api";
 import { useWagmiSession } from "../hooks/useWagmiSession";
+import {
+  useTokenHolderCount,
+  CSCS_CONTRACT_ADDRESS,
+  CSCR_CONTRACT_ADDRESS,
+  type TokenHolderCountResult,
+} from "../hooks/useTokenHolderCount";
 import { usePortfolio, type PortfolioData } from "./portfolio-context";
 import { getApiBase } from "../services/wagmi-api";
 import { Address } from "./Address";
 import { AddressInput } from "./AddressInput";
+import { inputPropsWithDomValue, optionPropsWithDomValue, selectPropsWithDomValue } from "./controlled-dom-props";
 import scaffoldConfig from "../scaffold.config";
 
 /* CoinGecko API hook */
@@ -230,7 +236,7 @@ const BALANCE_OF_SELECTOR = "0x70a08231";
 const DECIMALS_SELECTOR = "0x313ce567";
 
 async function fetchEthBalance(address: string): Promise<number> {
- const res = await fetch(ETH_RPC, {
+ const ethRpcResponse = await fetch(ETH_RPC, {
   method: "POST",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({
@@ -240,15 +246,15 @@ async function fetchEthBalance(address: string): Promise<number> {
    id: 1,
   }),
  });
- const json = await res.json();
- const weiHex = json.result as string;
+ const ethBalanceRpcJson = await ethRpcResponse.json();
+ const weiHex = ethBalanceRpcJson.result as string;
  // Convert wei to ETH (divide by 1e18)
  return parseInt(weiHex, 16) / 1e18;
 }
 
 async function fetchTokenBalance(tokenContract: string, walletAddress: string): Promise<number> {
  const paddedAddress = walletAddress.toLowerCase().replace("0x", "").padStart(64, "0");
- const data = `${BALANCE_OF_SELECTOR}${paddedAddress}`;
+ const balanceOfCallHex = `${BALANCE_OF_SELECTOR}${paddedAddress}`;
 
  // Fetch balance
  const balRes = await fetch(ETH_RPC, {
@@ -257,7 +263,7 @@ async function fetchTokenBalance(tokenContract: string, walletAddress: string): 
   body: JSON.stringify({
    jsonrpc: "2.0",
    method: "eth_call",
-   params: [{ to: tokenContract, data }, "latest"],
+   params: [{ to: tokenContract, data: balanceOfCallHex }, "latest"],
    id: 2,
   }),
  });
@@ -390,210 +396,7 @@ function formatUsd(value: number) {
  return value.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 });
 }
 
-function formatGwei(value: number) {
- if (value >= 100) return value.toFixed(0);
- if (value >= 10) return value.toFixed(1);
- if (value >= 1) return value.toFixed(2);
- return value.toFixed(3);
-}
-
-function formatUsdEstimate(value: number) {
- return value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
-function formatPhpEstimate(value: number) {
- return value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
-function formatDuration(seconds: number) {
- if (seconds < 60) return `${Math.round(seconds)}s`;
- const minutes = Math.floor(seconds / 60);
- const remainingSeconds = Math.round(seconds % 60);
- if (remainingSeconds === 0) return `${minutes}m`;
- return `${minutes}m ${remainingSeconds}s`;
-}
-
-function useGasFeeEstimate(chainId: number) {
- const [gasFeeGwei, setGasFeeGwei] = useState<number | null>(null);
- const [loading, setLoading] = useState(true);
- const [status, setStatus] = useState<"idle" | "ok" | "error">("idle");
- const [updatedAt, setUpdatedAt] = useState<number | null>(null);
-
- const fetchGasFee = useCallback(async () => {
-  setLoading(true);
-
-  try {
-   const response = await fetch(`${getApiBase()}/api/gas-fee?chainId=${chainId}`, {
-    credentials: "include",
-   });
-
-   if (!response.ok) throw new Error("gas-fee API failed");
-
-   const payload = (await response.json()) as {
-    ok?: boolean;
-    gasFeeGwei?: number | null;
-   };
-
-   const gwei = payload?.gasFeeGwei;
-   if (!payload?.ok || gwei == null || !Number.isFinite(Number(gwei)) || Number(gwei) <= 0) {
-    throw new Error("invalid gas estimate");
-   }
-
-   setGasFeeGwei(Number(gwei));
-   setStatus("ok");
-   setUpdatedAt(Date.now());
-  } catch {
-   setStatus("error");
-   setGasFeeGwei(null);
-  } finally {
-   setLoading(false);
-  }
- }, [chainId]);
-
- useEffect(() => {
-  fetchGasFee();
-  const interval = setInterval(fetchGasFee, 30000);
-  return () => clearInterval(interval);
- }, [fetchGasFee]);
-
- return { gasFeeGwei, loading, status, updatedAt, refetch: fetchGasFee };
-}
-
-function GasFeeStrip({ chainId, compact = false }: { chainId: number; compact?: boolean }) {
- const { isDark } = useTheme();
- const { gasFeeGwei, loading, status } = useGasFeeEstimate(chainId);
- const chainLabel = chainId === sepolia.id ? "Sepolia" : chainId === mainnet.id ? "Mainnet" : `Chain ${chainId}`;
- const { ethPrice } = usePortfolio();
- const [currency, setCurrency] = useState<"USD" | "PHP">("USD");
- const [phpRate, setPhpRate] = useState<number | null>(null);
-
- useEffect(() => {
-  let cancelled = false;
-
-  const fetchPhpRate = async () => {
-   try {
-    const response = await fetch("https://open.er-api.com/v6/latest/USD", {
-     credentials: "omit",
-    });
-    if (!response.ok) throw new Error("fx API failed");
-    const payload = (await response.json()) as { rates?: { PHP?: number } };
-    const rate = payload?.rates?.PHP;
-    if (!cancelled && rate && Number.isFinite(rate) && rate > 0) {
-     setPhpRate(rate);
-    }
-   } catch {
-    if (!cancelled) {
-     setPhpRate(56);
-    }
-   }
-  };
-
-  void fetchPhpRate();
-  return () => {
-   cancelled = true;
-  };
- }, []);
-
- const gasUsdEstimate = gasFeeGwei != null && Number.isFinite(ethPrice) && ethPrice > 0
-  ? (gasFeeGwei * 1e-9) * 21000 * ethPrice
-  : null;
-
- const gasPhpEstimate = gasUsdEstimate != null && phpRate != null && Number.isFinite(phpRate)
-  ? gasUsdEstimate * phpRate
-  : null;
-
- const estimatePrefix = currency === "PHP" ? "₱" : "$";
- const estimateAmount = loading
-  ? "--"
-  : currency === "PHP"
-   ? gasPhpEstimate != null
-    ? formatPhpEstimate(gasPhpEstimate)
-    : "--"
-   : gasUsdEstimate != null
-    ? formatUsdEstimate(gasUsdEstimate)
-    : "--";
-
- const baseBlockSeconds = chainId === mainnet.id ? 12 : chainId === sepolia.id ? 14 : 12;
- const transactionTimeSeconds = loading
-  ? null
-  : gasFeeGwei != null
-   ? (gasFeeGwei >= 40 ? 2 : gasFeeGwei >= 20 ? 3 : gasFeeGwei >= 10 ? 4 : 6) * baseBlockSeconds
-   : null;
- const transactionTimeLabel = loading
-  ? "--"
-  : transactionTimeSeconds != null
-   ? `~${formatDuration(transactionTimeSeconds)}`
-   : "--";
-
- return (
-  <div className={compact ? "w-full" : "mt-[12px] sm:mt-[14px] flex justify-center"}>
-   <div
-    className={compact ? "w-full flex flex-col gap-[4px] rounded-[14px] px-[12px] sm:px-[16px] py-[10px] min-h-[84px] h-full justify-center" : "inline-flex flex-col gap-[4px] rounded-[14px] px-[10px] sm:px-[12px] py-[8px]"}
-    style={{
-     backgroundColor: compact
-      ? (isDark ? "rgba(176,176,176,0.10)" : "rgba(79,70,229,0.07)")
-      : (isDark ? "rgba(176,176,176,0.10)" : "rgba(79,70,229,0.08)"),
-     border: compact ? "none" : `1px solid ${isDark ? "rgba(255,255,255,0.12)" : "rgba(79,70,229,0.22)"}`,
-    }}
-   >
-    <div className="inline-flex items-center gap-[10px]">
-     <span className="font-['Inter',sans-serif] text-[11px] sm:text-[12px]" style={{ color: isDark ? "rgba(255,255,255,0.72)" : "rgba(17,24,39,0.7)" }}>
-      GAS FEE
-     </span>
-     <span className="font-['Inter',sans-serif] font-semibold text-[11px] sm:text-[12px]" style={{ color: isDark ? "#ffffff" : "#111827" }}>
-      {loading ? "Loading..." : gasFeeGwei != null ? `${formatGwei(gasFeeGwei)} Gwei` : "N/A"}
-     </span>
-     <span className="font-['Inter',sans-serif] text-[10px] sm:text-[11px]" style={{ color: isDark ? "rgba(255,255,255,0.55)" : "rgba(55,65,81,0.6)" }}>
-      {chainLabel}
-     </span>
-     {status === "error" && !loading && (
-      <span className="font-['Inter',sans-serif] text-[10px] sm:text-[11px] text-[#fb035c]">RPC unavailable</span>
-     )}
-    </div>
-
-    <div className="inline-flex items-center gap-[6px]">
-     <span className="font-['Inter',sans-serif] text-[10px] sm:text-[11px]" style={{ color: isDark ? "rgba(255,255,255,0.72)" : "rgba(17,24,39,0.75)" }}>
-      Estimate:
-     </span>
-     <span
-      className="font-['Inter',sans-serif] font-extrabold text-[11px] sm:text-[13px]"
-      style={{ color: isDark ? "#a78bfa" : "#4f46e5" }}
-     >
-      {estimatePrefix} {estimateAmount}
-     </span>
-     <select
-      value={currency}
-      onChange={event => setCurrency(event.target.value as "USD" | "PHP")}
-      className="rounded-[8px] px-[6px] py-[2px] text-[10px] sm:text-[11px] font-['Inter',sans-serif]"
-      style={{
-       backgroundColor: isDark ? "rgba(17,24,39,0.85)" : "#ffffff",
-       color: isDark ? "#ffffff" : "#111827",
-       border: `1px solid ${isDark ? "rgba(255,255,255,0.2)" : "rgba(79,70,229,0.35)"}`,
-      }}
-      aria-label="Estimate currency"
-     >
-      <option value="USD">USD</option>
-      <option value="PHP">PHP</option>
-     </select>
-    </div>
-
-    <div className="inline-flex items-center gap-[6px]">
-     <span className="font-['Inter',sans-serif] text-[10px] sm:text-[11px]" style={{ color: isDark ? "rgba(255,255,255,0.72)" : "rgba(17,24,39,0.75)" }}>
-      Estimated Transaction Time:
-     </span>
-     <span
-      className="font-['Inter',sans-serif] font-bold text-[10px] sm:text-[12px]"
-      style={{ color: isDark ? "#34d399" : "#059669" }}
-     >
-      {transactionTimeLabel}
-     </span>
-    </div>
-   </div>
-  </div>
- );
-}
-
-function StatsRow({ savings, rewards, apy, loading, chainId }: { savings: number; rewards: number; apy: number; loading: boolean; chainId: number }) {
+function StatsRow({ savings, rewards, apy, loading }: { savings: number; rewards: number; apy: number; loading: boolean }) {
  const { isDark } = useTheme();
  const statBg = isDark ? 'bg-[rgba(176,176,176,0.1)]' : 'bg-[rgba(79,70,229,0.07)]';
  const statText = isDark ? 'text-white' : 'text-foreground';
@@ -644,11 +447,13 @@ function StatsRow({ savings, rewards, apy, loading, chainId }: { savings: number
     </div>
    </div>
 
+   {/* Gas fee strip moved to sidebar; restore if needed:
    <div className="grid grid-cols-1 sm:grid-cols-3 gap-[12px] sm:gap-[20px] w-full items-stretch">
     <GasFeeStrip chainId={chainId} compact />
     <div className="hidden sm:block" />
     <div className="hidden sm:block" />
    </div>
+   */}
   </div>
  );
 }
@@ -979,14 +784,14 @@ function ActionCard({ portfolio }: { portfolio: PortfolioData }) {
     <div className="flex flex-col gap-[12px]">
      <AddressInput
       placeholder="Recipient address (0x...)"
-      value={recipient}
+      addressText={recipient}
       onChange={setRecipient}
      />
      <input
-      className="bg-[#2b2b2b] rounded-[12px] h-[40px] flex items-center px-[16px] font-['Poppins',sans-serif] font-semibold text-[14px] text-white tracking-[0.14px] outline-none placeholder-white/50 w-full"
-      placeholder={`Amount (${selectedToken})`}
-      value={sendAmount}
-      onChange={(e) => setSendAmount(e.target.value)}
+      {...inputPropsWithDomValue(sendAmount, setSendAmount, {
+       className: "bg-[#2b2b2b] rounded-[12px] h-[40px] flex items-center px-[16px] font-['Poppins',sans-serif] font-semibold text-[14px] text-white tracking-[0.14px] outline-none placeholder-white/50 w-full",
+       placeholder: `Amount (${selectedToken})`,
+      })}
      />
      <div className="flex justify-center pt-[12px]">
       <Button
@@ -1003,16 +808,16 @@ function ActionCard({ portfolio }: { portfolio: PortfolioData }) {
     <div className="flex flex-col gap-[12px]">
      <p className="font-['Poppins',sans-serif] font-semibold text-[12px] text-[#86909c] tracking-[0.14px]">ETH → Token via Uniswap V2</p>
      <input
-      className="bg-[#2b2b2b] rounded-[12px] h-[40px] flex items-center px-[16px] font-['Poppins',sans-serif] font-semibold text-[14px] text-white tracking-[0.14px] outline-none placeholder-white/50 w-full"
-      placeholder="Amount (ETH)"
-      value={swapAmount}
-      onChange={(e) => setSwapAmount(e.target.value)}
+      {...inputPropsWithDomValue(swapAmount, setSwapAmount, {
+       className: "bg-[#2b2b2b] rounded-[12px] h-[40px] flex items-center px-[16px] font-['Poppins',sans-serif] font-semibold text-[14px] text-white tracking-[0.14px] outline-none placeholder-white/50 w-full",
+       placeholder: "Amount (ETH)",
+      })}
      />
      <input
-      className="bg-[#2b2b2b] rounded-[12px] h-[40px] flex items-center px-[16px] font-['Poppins',sans-serif] font-semibold text-[14px] text-white tracking-[0.14px] outline-none placeholder-white/50 w-full"
-      placeholder="Token address (out)"
-      value={tokenAddress}
-      onChange={(e) => setTokenAddress(e.target.value)}
+      {...inputPropsWithDomValue(tokenAddress, setTokenAddress, {
+       className: "bg-[#2b2b2b] rounded-[12px] h-[40px] flex items-center px-[16px] font-['Poppins',sans-serif] font-semibold text-[14px] text-white tracking-[0.14px] outline-none placeholder-white/50 w-full",
+       placeholder: "Token address (out)",
+      })}
      />
      <div className="flex justify-center pt-[12px]">
       <Button
@@ -1268,6 +1073,43 @@ function MarketOverview({ chainId }: { chainId: number }) {
      <p className="font-['Inter',sans-serif] text-[10px] text-[#86909c]">Live via CoinGecko &middot; 60s refresh</p>
     </div>
    )}
+  </div>
+ );
+}
+
+function TokenHolderOverviewCard() {
+ const cscs = useTokenHolderCount(CSCS_CONTRACT_ADDRESS);
+ const cscr = useTokenHolderCount(CSCR_CONTRACT_ADDRESS);
+
+ const row = (label: string, state: TokenHolderCountResult) => (
+  <div className="flex items-center justify-between gap-[12px] py-[6px]">
+   <p className="font-['Inter',sans-serif] font-semibold text-[14px] text-white shrink-0">{label}</p>
+   <div className="min-w-0 text-right">
+    {state.isLoading ? (
+     <span className="inline-block w-[72px] h-[16px] bg-white/10 rounded animate-pulse" />
+    ) : state.error ? (
+     <p className="font-['Inter',sans-serif] text-[12px] text-[#fb035c] truncate max-w-[180px]" title={state.error}>
+      {state.error}
+     </p>
+    ) : (
+     <p className="font-['Inter',sans-serif] font-semibold text-[15px] text-[#0FC6C2]">
+      {state.holderCount != null ? state.holderCount.toLocaleString() : "—"}
+     </p>
+    )}
+   </div>
+  </div>
+ );
+
+ return (
+  <div className="backdrop-blur-[10px] bg-[#1c1c1c]/60 rounded-[16px] p-[16px] sm:p-[20px]">
+   <p className="font-['Inter',sans-serif] font-medium text-[18px] sm:text-[20px] text-white mb-[12px]">TOKEN HOLDERS</p>
+   <div className="flex flex-col gap-[4px]">
+    {row("CSCS", cscs)}
+    {row("CSCR", cscr)}
+   </div>
+   <div className="flex items-center gap-[6px] mt-[12px] pt-[10px] border-t border-white/5">
+    <p className="font-['Inter',sans-serif] text-[10px] text-[#86909c]">Ethereum mainnet · Holder data via Ethplorer</p>
+   </div>
   </div>
  );
 }
@@ -1552,7 +1394,7 @@ export function DashboardPage() {
      className="backdrop-blur-[10px] rounded-[16px] p-[16px] sm:p-[20px] transition-colors duration-300 w-full overflow-hidden"
      style={{ backgroundColor: tc.cardBg, border: `1px solid ${tc.cardBorder}` }}
     >
-     <StatsRow savings={portfolioData.savings} rewards={portfolioData.rewards} apy={portfolioData.apy} loading={portfolioData.loading} chainId={portfolioData.activeChainId} />
+     <StatsRow savings={portfolioData.savings} rewards={portfolioData.rewards} apy={portfolioData.apy} loading={portfolioData.loading} />
      <div className="flex items-center gap-[12px] sm:gap-[16px] mt-[16px] flex-wrap">
       <p className="font-['Inter',sans-serif] font-medium text-[18px] sm:text-[24px]" style={{ color: tc.textPrimary }}>BALANCE</p>
       <div
@@ -1572,15 +1414,17 @@ export function DashboardPage() {
             View
           </span>
           <select
-            value={portfolioData.activeChainId}
-            onChange={(e) => portfolioData.setActiveChainId(Number(e.target.value))}
-            className="bg-transparent font-['Inter',sans-serif] font-semibold text-[11px] sm:text-[12px] outline-none"
-            style={{ color: tc.textPrimary }}
+            {...selectPropsWithDomValue(
+              String(portfolioData.activeChainId),
+              (nextChainId) => portfolioData.setActiveChainId(Number(nextChainId)),
+              {
+               className: "bg-transparent font-['Inter',sans-serif] font-semibold text-[11px] sm:text-[12px] outline-none",
+               style: { color: tc.textPrimary },
+              },
+            )}
           >
             {chainOptions.map((opt) => (
-              <option key={opt.id} value={opt.id}>
-                {opt.label}
-              </option>
+              <option key={opt.id} {...optionPropsWithDomValue(opt.label, String(opt.id))} />
             ))}
           </select>
         </label>
@@ -1621,14 +1465,15 @@ export function DashboardPage() {
           )}
      <PriceChart chainId={portfolioData.activeChainId} />
     </div>
-    <UserAssetsTable assets={portfolioData.assets} loading={portfolioData.loading} ethHoldings={portfolioData.ethHoldings} ethPrice={portfolioData.ethPrice} />
     <ActionCard portfolio={portfolioData} />
+    <UserAssetsTable assets={portfolioData.assets} loading={portfolioData.loading} ethHoldings={portfolioData.ethHoldings} ethPrice={portfolioData.ethPrice} />
    </div>
 
    {/* Right sidebar – 5 columns on desktop, stacks below on mobile */}
    <div className="lg:col-span-5 flex flex-col gap-[16px] min-w-0">
     <ProfileMiniCard />
     <MarketOverview chainId={portfolioData.activeChainId} />
+    <TokenHolderOverviewCard />
     <WalletAddress />
     <JoinCommunity />
    </div>
